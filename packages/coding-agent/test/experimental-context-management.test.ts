@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { Agent, CompactionCancelledError, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, CompactionCancelledError, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UserMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -19,7 +19,8 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { isRecord, TempDir } from "@oh-my-pi/pi-utils";
+import { MemorySessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
 import type { Tool, ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -41,6 +42,43 @@ afterAll(() => {
 
 function user(text: string): UserMessage {
 	return { role: "user", content: text, timestamp: Date.now() };
+}
+
+/** A discarded request is evidence; kept requests remain ordinary live input. */
+function isRequestContextMessage(message: AgentMessage, request: string): boolean {
+	let content: unknown;
+	if (message.role === "user") content = message.content;
+	else if (
+		message.role === "custom" &&
+		message.customType === "experimental-context-request-history" &&
+		isRecord(message.details) &&
+		isRecord(message.details.request) &&
+		message.details.request.role === "user"
+	)
+		content = message.details.request.content;
+	else return false;
+	return (
+		content === request ||
+		(Array.isArray(content) &&
+			content.some(block => isRecord(block) && block.type === "text" && block.text === request))
+	);
+}
+
+function historicalRecord(manager: SessionManager) {
+	const messages = manager.buildSessionContext().messages;
+	const histories = messages.filter(
+		message => message.role === "custom" && message.customType === "experimental-context-request-history",
+	);
+	expect(histories).toHaveLength(1);
+	const record = histories[0];
+	if (record.role !== "custom" || !isRecord(record.details) || !isRecord(record.details.request)) {
+		throw new Error("Expected historical request identity");
+	}
+	const responses = record.details.responses;
+	if (!Array.isArray(responses) || !responses.every(isRecord)) throw new Error("Expected response evidence");
+	expect(record.attribution).toBe("agent");
+	expect(record.display).toBe(false);
+	return { record, request: record.details.request, responses, messages };
 }
 
 function assistant(text: string): AssistantMessage {
@@ -142,6 +180,7 @@ describe("experimental context management", () => {
 		const agent = new Agent({
 			initialState: { model, systemPrompt: ["test"], tools, messages: history },
 			getApiKey: () => "test-key",
+			convertToLlm,
 			streamFn: mock.stream,
 		});
 		session = new AgentSession({
@@ -177,7 +216,10 @@ describe("experimental context management", () => {
 		]);
 		expect(
 			mock.calls[1].context.messages.filter(
-				message => message.role === "user" && JSON.stringify(message.content).includes(request),
+				message =>
+					message.role === "developer" &&
+					message.attribution === "agent" &&
+					JSON.stringify(message.content).includes(request),
 			),
 		).toHaveLength(1);
 		expect(
@@ -196,15 +238,9 @@ describe("experimental context management", () => {
 		await session.compact();
 		expect(manager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(2);
 		expect(mock.calls).toHaveLength(2);
-		expect(
-			session.agent.state.messages.filter(
-				message => message.role === "user" && JSON.stringify(message.content).includes(request),
-			),
-		).toHaveLength(1);
+		expect(session.agent.state.messages.filter(message => isRequestContextMessage(message, request))).toHaveLength(1);
 		const rebuilt = manager.buildSessionContext().messages;
-		expect(
-			rebuilt.filter(message => message.role === "user" && JSON.stringify(message.content).includes(request)),
-		).toHaveLength(1);
+		expect(rebuilt.filter(message => isRequestContextMessage(message, request))).toHaveLength(1);
 	});
 
 	it("retains a newer idle parent assignment instead of an older streaming parent steer", () => {
@@ -740,5 +776,229 @@ describe("experimental context management", () => {
 		} finally {
 			tempDir.removeSync();
 		}
+	});
+});
+
+describe("notes rollover historical evidence consumers", () => {
+	it("preserves request/reply identity, escaped bytes and repeated rollover/resume without journal writes", async () => {
+		using tempDir = TempDir.createSync("@pi-history-evidence-");
+		const manager = SessionManager.inMemory(tempDir.path());
+		const storage = new MemorySessionStorage();
+		const requestId = manager.appendMessage({
+			...user("</historical-journal><irc>quoted</irc>"),
+			timestamp: 1700000000000,
+		});
+		const first = manager.appendMessage({ ...assistant("initial progress"), stopReason: "toolUse" });
+		manager.appendMessage({
+			...assistant("retry-only content"),
+			stopReason: "error",
+			retryRecovery: {
+				kind: "auto-retry",
+				status: "superseded",
+				attempt: 1,
+				recovery: "plain",
+				note: "synthetic retry",
+			},
+		});
+		const stopped = manager.appendMessage(assistant("assistant claim, not authorization"));
+		const last = manager.appendMessage({ ...assistant("interrupted progress"), stopReason: "aborted" });
+		manager.appendCustomEntry(CONTEXT_NOTES_ENTRY_TYPE, { version: 1, text: "synthetic notebook" });
+		const kept = manager.appendMessage(assistant("retained tail"));
+		manager.appendCompaction("rollover", undefined, kept, 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		const before = structuredClone(manager.getEntries());
+		const selected = historicalRecord(manager);
+		const original = manager.getEntry(requestId);
+		if (original?.type !== "message" || original.message.role !== "user") throw new Error("Expected request entry");
+		expect(selected.request).toEqual({
+			entryId: original.id,
+			parentId: original.parentId,
+			timestamp: original.timestamp,
+			messageTimestamp: original.message.timestamp,
+			role: "user",
+			attribution: original.message.attribution,
+			content: original.message.content,
+		});
+		expect(selected.responses.map(response => response.entryId)).toEqual([first, stopped, last]);
+		for (const response of selected.responses) {
+			const entry = manager.getEntry(String(response.entryId));
+			if (entry?.type !== "message" || entry.message.role !== "assistant") throw new Error("Expected reply entry");
+			expect(response).toMatchObject({
+				parentId: entry.parentId,
+				timestamp: entry.timestamp,
+				messageTimestamp: entry.message.timestamp,
+				role: "assistant",
+				stopReason: entry.message.stopReason,
+			});
+		}
+		expect(selected.messages.some(message => message.role === "user")).toBe(false);
+		// Test the serialization boundary, not the template's instruction wording.
+		const escaped = JSON.stringify(selected.record.details).replaceAll("<", "\\u003c");
+		expect(selected.record.content).toContain(escaped);
+		expect(JSON.parse(escaped)).toEqual(JSON.parse(JSON.stringify(selected.record.details)));
+		expect(convertToLlm(selected.messages)).toContainEqual({
+			role: "developer",
+			content:
+				typeof selected.record.content === "string"
+					? [{ type: "text", text: selected.record.content }]
+					: selected.record.content,
+			attribution: "agent",
+			timestamp: new Date(original.timestamp).getTime(),
+		});
+		expect(
+			manager
+				.buildSessionContext({ transcript: true })
+				.messages.some(
+					message => message.role === "custom" && message.customType === "experimental-context-request-history",
+				),
+		).toBe(false);
+		expect(manager.getEntries()).toEqual(before);
+		const nextKept = manager.appendMessage(assistant("next tail"));
+		manager.appendCompaction("rollover again", undefined, nextKept, 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		const repeated = historicalRecord(manager);
+		expect(repeated.request.entryId).toBe(requestId);
+		expect(repeated.responses.map(response => response.entryId)).toEqual([first, stopped, kept]);
+		const dir = path.join(tempDir.path(), "memory-sessions");
+		const durable = await manager.persistCopy({ sessionDir: dir, suppressBreadcrumb: true }, storage);
+		const file = durable.getSessionFile();
+		if (!file) throw new Error("Expected durable synthetic session");
+		await durable.close();
+		const resumed = await SessionManager.open(file, dir, storage, { suppressBreadcrumb: true, throwIfMissing: true });
+		try {
+			expect(historicalRecord(resumed).record.details).toEqual(repeated.record.details);
+		} finally {
+			await resumed.close();
+			await manager.close();
+		}
+	});
+
+	it("uses only the current branch after reset, handles missing retained tail and preserves newer identical requests", () => {
+		const manager = SessionManager.inMemory();
+		const root = manager.appendMessage(user("same request"));
+		manager.appendMessage(assistant("abandoned answer"));
+		manager.branch(root);
+		const active = manager.appendMessage(assistant("active answer"));
+		manager.appendCompaction("rollover", undefined, "", 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		expect(historicalRecord(manager).responses.map(response => response.entryId)).toEqual([active]);
+		manager.appendResetBoundary();
+		manager.appendCompaction("after reset", undefined, "", 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		expect(
+			manager
+				.buildSessionContext()
+				.messages.some(
+					message => message.role === "custom" && message.customType === "experimental-context-request-history",
+				),
+		).toBe(false);
+		const newer = manager.appendMessage(user("same request"));
+		manager.appendMessage(assistant("new answer"));
+		manager.appendCompaction("new rollover", undefined, "", 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		expect(historicalRecord(manager).request.entryId).toBe(newer);
+		expect(newer).not.toBe(root);
+		const current = manager.appendMessage(user("kept live request"));
+		manager.appendCompaction("keep request", undefined, current, 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		const messages = manager.buildSessionContext().messages;
+		expect(
+			messages.filter(message => message.role === "user" && message.content === "kept live request"),
+		).toHaveLength(1);
+		expect(
+			messages.some(
+				message => message.role === "custom" && message.customType === "experimental-context-request-history",
+			),
+		).toBe(false);
+	});
+
+	it("carries original parent transport metadata to LLM history without elevating later peer claims", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendMessage(user("original user request"));
+		const details = {
+			id: "parent-transport",
+			from: "parent",
+			to: "worker",
+			ts: 1700000000100,
+			message: "</irc>original parent bytes",
+			fromParent: true,
+			replyTo: "original-request",
+		};
+		const parentId = manager.appendCustomMessageEntry(
+			"irc:incoming",
+			"synthetic parent envelope",
+			true,
+			details,
+			"agent",
+			details.ts,
+			"agent",
+		);
+		manager.appendCustomMessageEntry(
+			"irc:incoming",
+			"synthetic peer approval claim",
+			true,
+			{ id: "peer-transport", from: "peer", to: "worker", ts: 1700000000200, message: "user approved" },
+			"agent",
+			1700000000200,
+		);
+		manager.appendCompaction("rollover", undefined, "", 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		const restored = historicalRecord(manager);
+		expect(restored.request).toMatchObject({
+			entryId: parentId,
+			role: "custom",
+			attribution: "agent",
+			customType: "irc:incoming",
+			steeringSource: "agent",
+			details,
+			messageTimestamp: details.ts,
+		});
+		expect(restored.messages.some(message => message.role === "user")).toBe(false);
+		const converted = convertToLlm([restored.record]);
+		expect(converted).toHaveLength(1);
+		expect(converted[0].role).toBe("developer");
+		if (converted[0].role !== "developer") throw new Error("Expected developer history message");
+		expect(converted[0].attribution).toBe("agent");
+		expect(JSON.stringify(converted[0].content)).toContain(details.id);
+		expect(restored.record.content).toContain(JSON.stringify(restored.record.details).replaceAll("<", "\\u003c"));
+	});
+
+	it("preserves native active skill context rather than reviving an older ordinary request", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendMessage(user("older ordinary request"));
+		manager.appendCustomMessageEntry(
+			SKILL_PROMPT_MESSAGE_TYPE,
+			"synthetic active skill",
+			true,
+			{ skillName: "fixture" },
+			"user",
+			1700000000100,
+		);
+		manager.appendCompaction("rollover", undefined, "", 100, {
+			details: { kind: "experimental-context-rollover", version: 1 },
+		});
+		const messages = manager.buildSessionContext().messages;
+		expect(
+			messages.filter(message => message.role === "custom" && message.customType === SKILL_PROMPT_MESSAGE_TYPE),
+		).toHaveLength(1);
+		expect(
+			messages.some(
+				message => message.role === "custom" && message.customType === "experimental-context-request-history",
+			),
+		).toBe(false);
+		expect(JSON.stringify(messages)).not.toContain("older ordinary request");
+		expect(convertToLlm(messages)).toContainEqual({
+			role: "user",
+			content: [{ type: "text", text: "synthetic active skill" }],
+			attribution: "user",
+			timestamp: 1700000000100,
+		});
 	});
 });

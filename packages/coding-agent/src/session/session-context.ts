@@ -1,19 +1,26 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { customMessageEntryMessage, isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import {
+	customMessageEntryMessage,
+	isUserRequestEntry,
+	transcriptEntryMessage,
+} from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { getAnthropicCompactionPayload, isTurnStartEntry } from "@oh-my-pi/pi-agent-core/compaction";
 import {
 	coerceServiceTierByFamily,
+	type AssistantMessage,
 	type OpenAIResponsesHistoryPayload,
 	type ServiceTierByFamily,
 } from "@oh-my-pi/pi-ai";
 import * as snapcompact from "@oh-my-pi/snapcompact";
-import { isRecord } from "@oh-my-pi/pi-utils";
+import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import experimentalContextRequestHistoryPrompt from "../prompts/system/experimental-context-request-history.md" with { type: "text" };
 import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	isEmptyErrorTurn,
+	isUserInvokedSkillPrompt,
 	PREWALK_PLAN_MESSAGE_TYPE,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
@@ -228,6 +235,88 @@ export type TranscriptEntry = SessionMessageEntry | CustomMessageEntry;
 
 export function isTranscriptEntry(entry: SessionEntry): entry is TranscriptEntry {
 	return entry.type === "message" || entry.type === "custom_message";
+}
+
+interface ExperimentalRequestResponse {
+	entryId: string;
+	parentId: string | null;
+	timestamp: string;
+	messageTimestamp: number;
+	role: "assistant";
+	stopReason: AssistantMessage["stopReason"];
+	content: { type: "text"; text: string }[];
+}
+
+/** Recover discarded requests as sourced history, never newly delivered turns.
+ * Skill instructions retain their native active-context consumer shape. */
+function experimentalRequestHistory(
+	path: readonly SessionEntry[],
+	requestIndex: number,
+	discardedEnd: number,
+): AgentMessage | undefined {
+	const entry = path[requestIndex];
+	if (!isTranscriptEntry(entry)) return undefined;
+	const message = transcriptEntryMessage(entry);
+	if (!message || (message.role !== "user" && message.role !== "custom")) return undefined;
+	if (message.role === "custom" && isUserInvokedSkillPrompt(message)) return message;
+	const request = {
+		entryId: entry.id,
+		parentId: entry.parentId,
+		timestamp: entry.timestamp,
+		messageTimestamp: message.timestamp,
+		role: message.role,
+		attribution: message.attribution,
+		...(message.role === "custom"
+			? { customType: message.customType, details: message.details, steeringSource: message.steeringSource }
+			: {}),
+		content: message.content,
+	};
+	let firstResponseIndex = -1;
+	let firstStoppedResponseIndex = -1;
+	let latestResponseIndex = -1;
+	for (let index = requestIndex + 1; index < discardedEnd; index++) {
+		const responseEntry = path[index];
+		if (responseEntry.type !== "message" || responseEntry.message.role !== "assistant") continue;
+		const response = responseEntry.message;
+		if (response.retryRecovery) continue;
+		if (!response.content.some(block => block.type === "text" && block.text.length > 0)) continue;
+		if (firstResponseIndex < 0) firstResponseIndex = index;
+		if (firstStoppedResponseIndex < 0 && response.stopReason === "stop") firstStoppedResponseIndex = index;
+		latestResponseIndex = index;
+	}
+	const responses: ExperimentalRequestResponse[] = [];
+	for (const index of [firstResponseIndex, firstStoppedResponseIndex, latestResponseIndex]) {
+		if (index < 0) continue;
+		const responseEntry = path[index];
+		if (responses.some(existing => existing.entryId === responseEntry.id)) continue;
+		if (responseEntry.type !== "message" || responseEntry.message.role !== "assistant") continue;
+		const response = responseEntry.message;
+		const content: ExperimentalRequestResponse["content"] = [];
+		for (const block of response.content) {
+			if (block.type === "text") content.push({ type: "text", text: block.text });
+		}
+		responses.push({
+			entryId: responseEntry.id,
+			parentId: responseEntry.parentId,
+			timestamp: responseEntry.timestamp,
+			messageTimestamp: response.timestamp,
+			role: response.role,
+			stopReason: response.stopReason,
+			content,
+		});
+	}
+	const journal = { request, responses };
+	// Escaping keeps harness tags inside the historical quote, while parsed
+	// JSON and journal details retain the original transport/content bytes.
+	const serializedJournal = JSON.stringify(journal).replaceAll("<", "\\u003c");
+	return createCustomMessage(
+		"experimental-context-request-history",
+		prompt.render(experimentalContextRequestHistoryPrompt, { journal: serializedJournal }).trim(),
+		false,
+		journal,
+		entry.timestamp,
+		"agent",
+	);
 }
 
 export function buildSessionContext(
@@ -542,26 +631,26 @@ export function buildSessionContext(
 			pushMessage(compactionSummaryMsg);
 		}
 
-		// Notes-backed windows do not summarize a discarded turn prefix. Recover
-		// its latest authoritative request verbatim, independently of the
-		// disposable tail. Parent IRC delivered while idle is persisted as a
-		// custom message, while a mid-stream parent steer is a user message; both
-		// are request candidates, but peer IRC remains ordinary agent context.
-		// Resolve from the branch journal so repeated rollovers and resume retain
-		// it too, without copying messages into compaction metadata or transcripts.
-		// Attribution follows the shared turn-initiator semantics so a
-		// user-invoked skill or writable-collab request is retained like an
-		// ordinary one instead of being skipped for an older plain user message.
+		// Notes-backed windows do not summarize discarded requests. Restore the
+		// latest authoritative one as sourced history with reply evidence, never
+		// a fresh turn. Parent IRC is a candidate, peer IRC is not. Resolve only
+		// from the active branch after reset on every rollover and resume.
 		if (
 			!options?.transcript &&
 			isRecord(compaction.details) &&
 			compaction.details.kind === "experimental-context-rollover"
 		) {
-			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
+			const firstKeptIdx = path.findIndex(
+				(entry, index) => index < compactionIdx && entry.id === compaction.firstKeptEntryId,
+			);
+			const discardedEnd = firstKeptIdx >= 0 ? firstKeptIdx : compactionIdx;
 			for (let i = compactionIdx - 1; i > resetBoundaryIdx; i--) {
 				const entry = path[i];
 				if (!isRolloverRequestEntry(entry)) continue;
-				if (i < firstKeptIdx) appendMessage(entry);
+				if (i < discardedEnd) {
+					const history = experimentalRequestHistory(path, i, discardedEnd);
+					if (history) pushMessage(history);
+				}
 				break;
 			}
 		}

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed notes rollover and session resume so discarded requests and replies remain historical evidence without becoming new live input.
 - Fixed incremental `yield` batches, nested array items, and schema normalization so assembled results keep the declared output shape.
 - Fixed IRC replay so message identity includes both sender and ID, and parent attribution comes from the original transport.
 - Fixed judgment failures so aggregate errors retain typed underlying causes.
