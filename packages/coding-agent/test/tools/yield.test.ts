@@ -828,13 +828,13 @@ describe("YieldTool", () => {
 		).toEqual({ type: "summary" });
 	});
 
-	it("emits Codex-valid yield parameters: no top-level combinator under strict mode", () => {
+	it("emits Codex-valid partial yield parameters without a top-level combinator", () => {
 		const tool = new YieldTool(
 			createSession({
 				outputSchema: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
 			}),
 		);
-		expect(tool.strict).toBe(true);
+		expect(tool.strict).toBe(false);
 
 		const toolDefinition: Tool = {
 			name: tool.name,
@@ -844,7 +844,7 @@ describe("YieldTool", () => {
 		};
 		const [converted] = convertOpenAICodexResponsesTools([toolDefinition], makeCodexModel());
 		if (converted.type !== "function") throw new Error("expected a function tool payload");
-		expect(converted.strict).toBe(true);
+		expect(converted.strict).toBe(false);
 
 		const params = converted.parameters;
 		expect(params.type).toBe("object");
@@ -853,14 +853,16 @@ describe("YieldTool", () => {
 		for (const combinator of ["allOf", "anyOf", "oneOf", "enum", "const", "not"]) {
 			expect(params[combinator]).toBeUndefined();
 		}
-		// Strict enforcement makes the optional `type`/`data`/`error` properties
-		// required + nullable, so the model signals omission with `null`.
-		const props = toRecord(params.properties);
-		for (const name of ["type", "data", "error"]) {
-			const prop = toRecord(props[name]);
-			const variants = Array.isArray(prop.anyOf) ? prop.anyOf.map(toRecord) : [];
-			expect(variants.some(variant => variant.type === "null")).toBe(true);
-		}
+		// Omitted keys stay genuinely optional; explicit null need not stand in for omission.
+		expect(params.required).toEqual([]);
+		expect(
+			validateToolArguments(toolDefinition, {
+				type: "toolCall",
+				id: "partial-wire",
+				name: tool.name,
+				arguments: { type: "result", data: {} },
+			}),
+		).toBeDefined();
 	});
 
 	it("treats strict-mode nulls as omitted arguments", async () => {
@@ -963,7 +965,7 @@ describe("YieldTool", () => {
 				},
 			}),
 		);
-		expect(tool.strict).toBe(true);
+		expect(tool.strict).toBe(false);
 		const result = await tool.execute("call-tuple", {
 			data: {
 				tuple: [
@@ -1062,6 +1064,8 @@ describe("YieldTool", () => {
 			(Array.isArray(nullable.anyOf) ? nullable.anyOf : []).find(v => toRecord(v).type === "object"),
 		);
 
+		// No declared property schemas means no labelled partial-object wire branch.
+		// Preserve the native strict adapter contract for this required-only declaration.
 		expect(tool.strict).toBe(true);
 		expect(dataSchema.properties).toEqual({});
 		expect(dataSchema.required).toEqual([]);
@@ -1132,7 +1136,7 @@ describe("YieldTool", () => {
 		).rejects.toThrow("Output does not match schema");
 	});
 
-	it("expands section variants so a strict reviewer can submit one incremental section", () => {
+	it("expands section variants so a reviewer can submit one incremental section", () => {
 		const tool = new YieldTool(
 			createSession({
 				outputSchema: {
@@ -1156,7 +1160,7 @@ describe("YieldTool", () => {
 			}),
 		);
 
-		expect(tool.strict).toBe(true);
+		expect(tool.strict).toBe(false);
 
 		const toolDefinition: Tool = {
 			name: tool.name,
@@ -1195,10 +1199,10 @@ describe("YieldTool", () => {
 			}),
 		).toBeDefined();
 
-		// Stays Codex-valid: strict, no top-level combinator.
+		// Stays Codex-valid: non-strict partial protocol, no top-level combinator.
 		const [converted] = convertOpenAICodexResponsesTools([toolDefinition], makeCodexModel());
 		if (converted.type !== "function") throw new Error("expected a function tool payload");
-		expect(converted.strict).toBe(true);
+		expect(converted.strict).toBe(false);
 		for (const combinator of ["allOf", "anyOf", "oneOf", "enum", "const", "not"]) {
 			expect(converted.parameters[combinator]).toBeUndefined();
 		}

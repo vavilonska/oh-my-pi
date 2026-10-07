@@ -724,8 +724,9 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 			} else {
 				const { validator, error: schemaError, normalized } = buildOutputValidator(outputSchema);
 				const submittedData = assembled.rawText ? assembled.data : parseStringifiedJson(assembled.data ?? null);
-				const completeData =
-					mode === "strict" ? (validator?.normalize(submittedData) ?? submittedData) : submittedData;
+				// Canonicalize assembled data in every mode, matching the in-tool terminal gate.
+				// Mode controls rejection/override policy, not the delivered payload's null semantics.
+				const completeData = validator?.normalize(submittedData) ?? submittedData;
 				const validation = validator?.validate(completeData);
 				const failure =
 					validation && !validation.success

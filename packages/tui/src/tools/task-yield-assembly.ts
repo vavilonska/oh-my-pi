@@ -124,9 +124,10 @@ function appendYieldSection(
  *
  * A non-empty array `type` contributes incremental sections and never decides
  * termination by itself. Labelled objects supply per-label values; array sections
- * append elements or batches without adding another array level. Explicit terminal
- * payloads replace the accumulated result. A data-less terminal closes accumulated
- * sections, or uses the last assistant text if none exist.
+ * append elements or batches without adding another array level. Terminal objects
+ * inherit omitted fields and replace explicit fields, including empty arrays.
+ * Other terminal payloads replace the accumulated result. A data-less terminal
+ * closes accumulated sections, or uses the last assistant text if none exist.
  */
 export function assembleYieldResult(
 	yieldItems: YieldItem[],
@@ -181,16 +182,25 @@ export function assembleYieldResult(
 		}
 	}
 
-	// An explicit terminal payload wins: an untyped final result or a
-	// `type: "result"` finalize that carries `data` is the complete result, used
-	// verbatim — never wrapped in a section.
+	// Merge only at the top-level boundary. Explicit terminal fields replace
+	// accumulated values rather than recursively merging them.
 	if (terminalItem && terminalItem.data !== undefined) {
 		const resolved = resolveYieldPayload(terminalItem, lastAssistantText, []);
+		const mergesSections =
+			hasSections && resolved.value !== null && typeof resolved.value === "object" && !Array.isArray(resolved.value);
+		if (mergesSections) {
+			for (const key of Object.keys(resolved.value as Record<string, unknown>)) {
+				overriddenLabels.delete(key);
+				missingLabels.delete(key);
+			}
+		}
 		return {
-			data: resolved.value,
-			schemaOverridden: terminalItem.schemaOverridden === true,
+			data: mergesSections ? { ...sections, ...(resolved.value as Record<string, unknown>) } : resolved.value,
+			schemaOverridden:
+				terminalItem.schemaOverridden === true ||
+				(mergesSections && (schemaOverridden || overriddenLabels.size > 0)),
 			rawText: resolved.fromLastAssistantText && typeof resolved.value === "string",
-			missingData: resolved.missingData,
+			missingData: resolved.missingData || (mergesSections && missingLabels.size > 0),
 		};
 	}
 

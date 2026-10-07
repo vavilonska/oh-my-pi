@@ -7,7 +7,7 @@ Omit `type` for the usual single terminal structured result. Pass `type: ["secti
 {{/if}}
 {{#unless workPoolItems}}
 {{#if hasOutputSchema}}
-This task declares an output schema: the terminal `data` MUST be the full object matching it. A data-less `type: "result"` finalizes previously submitted incremental sections; it is invalid when no sections were submitted — prose in your last turn can never satisfy the schema.
+This task declares an output schema: the assembled terminal result MUST fully match it. With no prior sections, provide the complete result in `data`. After incremental sections, terminal object `data` replaces only explicitly supplied top-level fields; omitted fields retain their accumulated values. Replacement is not a recursive merge, and an explicit empty array clears that field. A data-less `type: "result"` finalizes accumulated sections only if the assembled result is complete and valid; it is invalid when no sections were submitted. Prose in your last turn cannot satisfy the schema.
 {{else}}
 Pass `type: "result"` to finalize; when `data` is omitted, your last assistant turn becomes the raw final result.
 {{/if}}

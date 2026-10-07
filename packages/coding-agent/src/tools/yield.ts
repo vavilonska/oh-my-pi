@@ -18,9 +18,15 @@ import {
 	sanitizeSchemaForStrictMode,
 	tryEnforceStrictSchema,
 } from "@oh-my-pi/pi-ai/utils/schema";
-import { resolveYieldSectionValue, type YieldSectionShapes } from "@oh-my-pi/pi-tui/tools/task-yield-assembly";
+import type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
+import {
+	assembleYieldResult,
+	resolveYieldSectionValue,
+	type YieldSectionShapes,
+} from "@oh-my-pi/pi-tui/tools/task-yield-assembly";
 import { prompt } from "@oh-my-pi/pi-utils";
 import yieldDescription from "../prompts/tools/yield.md" with { type: "text" };
+import yieldRetainedSchemaError from "../prompts/tools/yield-retained-schema-error.md" with { type: "text" };
 import { subprocessToolRegistry } from "../task/subprocess-tool-registry";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { yieldSectionShapes } from "../task/yield-assembly";
@@ -187,16 +193,10 @@ function formatYieldLabels(labels: readonly string[]): string {
 }
 
 /**
- * Expand a plain-object `data` schema into a strict union that ALSO accepts each
- * top-level section value (and array element) on its own. Agents that yield
- * incrementally (`type: ["findings"]`, `type: ["confidence"]`, …) submit one
- * section per call, so `data` is a single finding object or a lone verdict value
- * — never the full output object. Without this, strict-mode providers constrain
- * `data` to the whole schema and reject/—under constrained decoding—forbid the
- * partial. Every branch is a typed sub-schema, so strict representability holds;
- * the full-output object stays the first (terminal) branch. The assembled whole
- * is still validated against the full schema at finalization. Non-object / loose
- * schemas are returned unchanged.
+ * Admit section values/items and labelled partial objects alongside full output.
+ * Partial terminal objects require non-strict wire parameters: provider strict
+ * adaptation makes every declared key required and cannot express omitted fields.
+ * The accumulated output remains validated against the complete original schema.
  */
 function withSectionVariants(dataSchema: Record<string, unknown>): Record<string, unknown> {
 	if (dataSchema.type !== "object") return dataSchema;
@@ -214,6 +214,7 @@ function withSectionVariants(dataSchema: Record<string, unknown>): Record<string
 		branches.push(schema);
 	};
 	add(fullWithoutDescription);
+	add({ ...fullWithoutDescription, required: [] });
 	for (const name in propRecord) {
 		const prop = propRecord[name];
 		add(prop);
@@ -306,6 +307,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	#schemaValidationFailures = 0;
 	#emptyResultFailures = 0;
 	#hasIncrementalSections = false;
+	readonly #incrementalYieldItems: YieldItem[] = [];
 	readonly #sectionShapes: YieldSectionShapes;
 	readonly #session: ToolSession;
 	readonly #parameters: TSchema;
@@ -387,6 +389,10 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 					throw new Error("schema contains unresolved $ref after dereferencing");
 				}
 				dataSchema = withSectionVariants(resolved);
+				if (resolved.type === "object" && isPlainRecord(resolved.properties)) {
+					// Only yield's wire permits omitted patch keys; the output gate stays strict.
+					this.#schemaStrict = false;
+				}
 			} else {
 				this.#schemaStrict = false;
 				dataSchema = looseRecordSchema(
@@ -431,6 +437,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 	 */
 	resetTurnState(): void {
 		this.#hasIncrementalSections = false;
+		this.#incrementalYieldItems.length = 0;
 		this.#schemaValidationFailures = 0;
 		this.#emptyResultFailures = 0;
 	}
@@ -586,7 +593,7 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		}
 		const normalizeData = (value: unknown): unknown => {
 			if (workPoolItemId !== undefined) return value;
-			if (!isIncremental) return this.#normalizeData?.(value) ?? value;
+			if (!isIncremental) return this.#hasIncrementalSections ? value : (this.#normalizeData?.(value) ?? value);
 			if (!this.#normalizeSection) return value;
 			const labels = yieldType as string[];
 			// Preserve broadcasts rather than manufacturing an ambiguous labelled object.
@@ -615,15 +622,19 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 			return sections;
 		};
 		if (status === "success" && data !== undefined) data = normalizeData(data);
-		if (status === "success" && !useLastTurn) {
-			const validateData = (value: unknown): JsonSchemaValidationResult | undefined =>
-				workPoolItemId !== undefined
-					? undefined
-					: isIncremental
-						? this.#validateIncrementalSection(yieldType as string[], value)
-						: this.#validate
-							? this.#validate(value)
-							: undefined;
+		if (status === "success" && (!useLastTurn || (!isIncremental && this.#hasIncrementalSections))) {
+			const validateData = (value: unknown): JsonSchemaValidationResult | undefined => {
+				if (workPoolItemId !== undefined) return undefined;
+				if (isIncremental) return this.#validateIncrementalSection(yieldType as string[], value);
+				if (!this.#validate) return undefined;
+				const assembled = assembleYieldResult(
+					[...this.#incrementalYieldItems, { status: "success", type: yieldType, data: value, useLastTurn }],
+					this.#session.getLastAssistantText?.(),
+					this.#sectionShapes,
+				);
+				if (assembled?.schemaOverridden) throw new Error(yieldRetainedSchemaError.trim());
+				return this.#validate(this.#normalizeData?.(assembled?.data) ?? assembled?.data);
+			};
 			let sectionFailure = validateData(data);
 			if (sectionFailure && !sectionFailure.success && typeof data === "string") {
 				// Lossless recovery: a JSON-encoded payload string parses to exactly
@@ -670,7 +681,18 @@ export class YieldTool implements AgentTool<TSchema, YieldDetails> {
 		}
 
 		this.#emptyResultFailures = 0;
-		if (status === "success" && isIncremental) this.#hasIncrementalSections = true;
+		if (status === "success" && isIncremental) {
+			this.#hasIncrementalSections = true;
+			if (workPoolItemId === undefined) {
+				this.#incrementalYieldItems.push({
+					status,
+					type: yieldType,
+					data,
+					useLastTurn: useLastTurn || undefined,
+					schemaOverridden: schemaValidationOverridden || undefined,
+				});
+			}
+		}
 		let workPoolComplete = false;
 		let completedWorkPoolItem: WorkPoolYieldItem | undefined;
 		let remainingWorkPoolItems: readonly WorkPoolYieldItem[] = [];
