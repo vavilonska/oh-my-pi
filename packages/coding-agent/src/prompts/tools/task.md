@@ -6,8 +6,14 @@
 {{/if}}
 
 # Delegation
-Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout` only when files unknown.{{/if}} Prefer one agent to investigate + edit. Omit `agent` only for default (`{{defaultAgent}}`); NEVER specify it.
-Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate via `write agent://<id>`{{/if}}. Set interfaces in {{#if batchEnabled}}`context`{{else}}the task{{/if}}. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
+Use most specific agent.{{#if scoutAvailable}} Read-only research MUST use `scout` only when files unknown.{{/if}} Prefer one agent owning a complete module: investigation, implementation, and integration. Omit `agent` only for default (`{{defaultAgent}}`); NEVER specify it.
+Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate via `write agent://<id>`{{/if}}. Define interfaces and integration responsibility in {{#if batchEnabled}}`context`{{else}}the task{{/if}}.
+
+# Verification
+The module or integration owner runs the affected CLI/UI, checks, failure fixes, and cleanup; do not routinely hand execution back to the caller.
+Schedule verification by interference risk: establish the check's source dependencies and shared writes/devices. MUST NOT run against changing dependencies unless reliably isolated. Isolated local diagnostics may run early.
+Verify once the affected dependencies are stable; do not wait for unrelated work or repeat full suites at every phase. Re-run only what changed code, a failure, or a concrete coverage gap requires.
+Non-integrating leaves hand off implementation, verification entrypoints, and remaining dependencies as ready for integration—not fully verified. Read-only roles MUST NOT execute checks.
 
 # Inputs
 `name`: CamelCase ≤32, auto-generated if omitted; address agent by name. `outputSchema` overrides agent/session schemas.
