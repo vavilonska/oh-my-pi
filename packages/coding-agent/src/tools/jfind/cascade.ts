@@ -68,6 +68,8 @@ export interface CascadeOptions {
 	includeHidden: boolean;
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
+	/** Retain typed causes for health consumers; the tool report remains text-only. */
+	onJudgeError?: (error: unknown) => void;
 }
 
 export interface CascadeResult {
@@ -147,6 +149,7 @@ class Cascade {
 			return { ok: true, result };
 		} catch (error) {
 			throwIfAborted(signal);
+			this.#options.onJudgeError?.(error);
 			this.stats.requests++;
 			this.stats.errors++;
 			this.stats.apiMs += performance.now() - started;
