@@ -159,4 +159,138 @@ describe("wait", () => {
 		const result = await waiting;
 		expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "build complete" });
 	});
+	test("reused discovery failure expires from its original observation, not its last read", async () => {
+		let now = 1000;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
+		const broker = {
+			request: vi.fn(async () => {
+				throw new daemonClient.DaemonBrokerUnavailableError("Daemon list request timed out");
+			}),
+			onCompletion: () => () => {},
+		} as unknown as DaemonBrokerClient;
+		const factory = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+		const tool = new WaitTool(session(undefined, "Main", true));
+		await expect(tool.execute("failed", {})).rejects.toThrow("Last-known service state is not current");
+		expect(factory).toHaveBeenCalledTimes(1);
+		now += 59_000;
+		await expect(tool.execute("reused", {})).rejects.toThrow("Reused recent broker failure");
+		expect(factory).toHaveBeenCalledTimes(1);
+		now += 1_001;
+		await expect(tool.execute("expired", {})).rejects.toThrow("Last-known service state is not current");
+		expect(factory).toHaveBeenCalledTimes(2);
+		now += 60_001;
+		const recovered = {
+			request: vi.fn(async () => ({ op: "list", daemons: [] })),
+			onCompletion: () => () => {},
+		} as unknown as DaemonBrokerClient;
+		factory.mockResolvedValue(recovered);
+		await expect(tool.execute("recovered", {})).rejects.toThrow("Nothing to wait for");
+		await expect(tool.execute("fresh-again", {})).rejects.toThrow("Nothing to wait for");
+		expect(factory).toHaveBeenCalledTimes(4);
+	});
+
+	test("discovery failure reuse never hides a local deliverable or claims fresh services", async () => {
+		const broker = {
+			request: async () => {
+				throw new daemonClient.DaemonBrokerUnavailableError("Daemon broker connection closed");
+			},
+			onCompletion: () => () => {},
+		} as unknown as DaemonBrokerClient;
+		const factory = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+		const manager = new AsyncJobManager({ onJobComplete: () => {} });
+		const tool = new WaitTool(session(manager, "Main", true));
+		await expect(tool.execute("failed", {})).rejects.toThrow("Last-known service state is not current");
+		const id = manager.register("bash", "local-after-failure", async () => "local deliverable", { ownerId: "Main" });
+		await manager.waitForAll();
+		try {
+			const result = await tool.execute("local", {});
+			expect(result.details?.jobs?.[0]).toMatchObject({ id, status: "completed", resultText: "local deliverable" });
+			expect(manager.isJobResultConsumed(id)).toBe(true);
+			expect(factory).toHaveBeenCalledTimes(1);
+			expect(
+				result.content.some(block => block.type === "text" && block.text.includes("Reused recent broker failure")),
+			).toBe(true);
+			expect(
+				result.content.some(
+					block => block.type === "text" && block.text.includes("Last-known service state is not current"),
+				),
+			).toBe(true);
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	test("discovery failure reuse is scoped to cwd, session, and agent", async () => {
+		const broker = {
+			request: async () => {
+				throw new daemonClient.DaemonBrokerUnavailableError("Daemon list request timed out");
+			},
+			onCompletion: () => () => {},
+		} as unknown as DaemonBrokerClient;
+		const factory = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+		const current = session(undefined, "Main", true);
+		let sessionId = "session-one";
+		let agentId = "Main";
+		current.getSessionId = () => sessionId;
+		current.getAgentId = () => agentId;
+		const tool = new WaitTool(current);
+		await expect(tool.execute("first", {})).rejects.toThrow("Last-known service state is not current");
+		await expect(tool.execute("same", {})).rejects.toThrow("Reused recent broker failure");
+		expect(factory).toHaveBeenCalledTimes(1);
+		current.cwd += "/other-project";
+		await expect(tool.execute("cwd-changed", {})).rejects.toThrow("Last-known service state is not current");
+		expect(factory).toHaveBeenCalledTimes(2);
+		sessionId = "session-two";
+		await expect(tool.execute("session-changed", {})).rejects.toThrow("Last-known service state is not current");
+		expect(factory).toHaveBeenCalledTimes(3);
+		agentId = "Other";
+		await expect(tool.execute("agent-changed", {})).rejects.toThrow("Last-known service state is not current");
+		expect(factory).toHaveBeenCalledTimes(4);
+	});
+
+	test("caller cancellation during discovery is not reusable as a broker failure", async () => {
+		const entered = Promise.withResolvers<void>();
+		const response = Promise.withResolvers<never>();
+		const broker = {
+			request: async () => {
+				entered.resolve();
+				return response.promise;
+			},
+			onCompletion: () => () => {},
+		} as unknown as DaemonBrokerClient;
+		const factory = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+		const tool = new WaitTool(session(undefined, "Main", true));
+		const controller = new AbortController();
+		const waiting = tool.execute("cancelled", {}, controller.signal);
+		await entered.promise;
+		controller.abort();
+		await expect(waiting).rejects.toThrow("Operation aborted");
+		response.reject(new Error("Daemon broker request aborted"));
+		const recovered = {
+			request: async () => ({ op: "list", daemons: [] }),
+			onCompletion: () => () => {},
+		} as unknown as DaemonBrokerClient;
+		factory.mockResolvedValue(recovered);
+		await expect(tool.execute("next", {})).rejects.toThrow("Nothing to wait for");
+		expect(factory).toHaveBeenCalledTimes(2);
+	});
+	test("operation rejection and unclassified discovery errors are never reused as infrastructure failures", async () => {
+		for (const failure of [
+			new daemonClient.DaemonBrokerRejectedError("List rejected"),
+			new Error("Unclassified discovery failure"),
+		]) {
+			const broker = {
+				request: async () => {
+					throw failure;
+				},
+				onCompletion: () => () => {},
+			} as unknown as DaemonBrokerClient;
+			const factory = vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker);
+			const tool = new WaitTool(session(undefined, "Main", true));
+			await expect(tool.execute("first", {})).rejects.toThrow("Last-known service state is not current");
+			await expect(tool.execute("second", {})).rejects.toThrow("Last-known service state is not current");
+			expect(factory).toHaveBeenCalledTimes(2);
+			factory.mockRestore();
+		}
+	});
 });

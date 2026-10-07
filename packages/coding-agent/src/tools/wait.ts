@@ -6,6 +6,7 @@ import {
 	TOOL_INTERRUPT_ABORT_REASON,
 } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
+import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { IrcBus } from "../irc/bus";
 import waitDescription from "../prompts/tools/wait.md" with { type: "text" };
 import type { ToolSession } from ".";
@@ -24,6 +25,7 @@ import { cfgLaunchEnabled } from "./settings";
 const waitSchema = type({});
 const WAIT_MAX_MS = 30 * 60_000;
 const PROGRESS_INTERVAL_MS = 500;
+const SERVICE_REFRESH_FAILURE_MS = 60_000;
 
 interface WaitMessaging {
 	registry: AgentRegistry;
@@ -59,6 +61,8 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 	readonly intent = "optional";
 
 	constructor(private readonly session: ToolSession) {}
+	readonly #serviceRefreshFailures = new LRUCache<string, string>({ max: 1, ttl: SERVICE_REFRESH_FAILURE_MS });
+	#serviceRefreshGeneration = 0;
 
 	async execute(
 		_toolCallId: string,
@@ -75,25 +79,35 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 		const pending = takeQueuedMessage(messaging);
 		if (pending && messaging) return messageResult(messaging.senderId, pending);
 		const deadline = Date.now() + WAIT_MAX_MS;
-		let serviceError: string | undefined;
+		const scope = JSON.stringify([this.session.cwd, this.session.getSessionId?.(), senderId]);
+		let serviceError = this.#serviceRefreshFailures.get(scope);
+		const reusedFailure =
+			serviceError === undefined ? "" : " Reused recent broker failure; this call did not refresh service state.";
 		let serviceCurrent = false;
+		const generation = ++this.#serviceRefreshGeneration;
 		const refreshAbort = new AbortController();
 		const abortRefresh = () => refreshAbort.abort(signal?.reason);
 		signal?.addEventListener("abort", abortRefresh, { once: true });
 		// Discovery races local delivery; last-known services alone cannot sustain a wait.
-		let refresh = cfgLaunchEnabled.get(this.session.settings)
-			? listServicesTolerant(this.session, refreshAbort.signal).then(
-					result => {
-						if (refreshAbort.signal.aborted) return;
-						serviceError = result.error;
-						serviceCurrent = result.error === undefined;
-					},
-					error => {
-						if (refreshAbort.signal.aborted) return;
-						serviceError = error instanceof Error ? error.message : String(error);
-					},
-				)
-			: undefined;
+		let refresh =
+			cfgLaunchEnabled.get(this.session.settings) && serviceError === undefined
+				? listServicesTolerant(this.session, refreshAbort.signal).then(
+						result => {
+							if (refreshAbort.signal.aborted) return;
+							serviceError = result.error;
+							serviceCurrent = result.error === undefined;
+							if (generation === this.#serviceRefreshGeneration) {
+								if (result.error !== undefined && result.brokerUnavailable === true)
+									this.#serviceRefreshFailures.set(scope, result.error);
+								else this.#serviceRefreshFailures.delete(scope);
+							}
+						},
+						error => {
+							if (refreshAbort.signal.aborted) return;
+							serviceError = error instanceof Error ? error.message : String(error);
+						},
+					)
+				: undefined;
 		const finish = (result: AgentToolResult<CoordinationDetails>): AgentToolResult<CoordinationDetails> => {
 			if (serviceError === undefined) return result;
 			return {
@@ -102,7 +116,7 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 					...result.content,
 					{
 						type: "text",
-						text: `Service state unavailable: ${serviceError}. Last-known service state is not current.`,
+						text: `Service state unavailable: ${serviceError}. Last-known service state is not current.${reusedFailure}`,
 					},
 				],
 			};
@@ -123,7 +137,7 @@ export class WaitTool implements AgentTool<typeof waitSchema, CoordinationDetail
 						"Nothing to wait for: no background job or service you started is running. Other agents' results and messages arrive on their own." +
 							(serviceError === undefined
 								? ""
-								: ` Service state unavailable: ${serviceError}. Last-known service state is not current.`),
+								: ` Service state unavailable: ${serviceError}. Last-known service state is not current.${reusedFailure}`),
 					);
 				}
 				const refreshing = refresh;

@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Fixed repeated `wait` calls during broker outages so recent discovery failures are reused briefly while local task completions remain deliverable and stale service state stays explicit.
 - Fixed incremental `yield` batches, nested array items, and schema normalization so assembled results keep the declared output shape.
 - Fixed IRC replay so message identity includes both sender and ID, and parent attribution comes from the original transport.
 - Fixed judgment failures so aggregate errors retain typed underlying causes.
