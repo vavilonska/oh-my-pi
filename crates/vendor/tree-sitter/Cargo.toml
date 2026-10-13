@@ -84,7 +84,7 @@ version = "0.1.9"
 version = "0.1"
 
 [dependencies.wasmtime-c-api]
-version = "=36.0.7"
+version = "=36.0.17"
 features = [
     "cranelift",
     "gc-drc",

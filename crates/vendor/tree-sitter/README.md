@@ -10,9 +10,9 @@ MIT licensed; `LICENSE` is copied from that exact upstream commit.
 ## Local changes
 
 - `Cargo.toml`: `publish = false`; the optional Wasmtime C API dependency is
-  pinned to `=36.0.7` instead of `29.0.1`. This is the minimum supported
-  Wasmtime patch covering fork Dependabot alerts #1–14. The workspace lock
-  pins its complete runtime family to 36.0.7. The upstream generated-manifest
+  pinned to `=36.0.17` instead of `29.0.1`. This addresses fork Dependabot
+  alerts #1–15, including the table-allocation panic affecting 36.0.7.
+  The workspace lock pins its complete runtime family to 36.0.17. The upstream generated-manifest
   preamble, `Cargo.toml.orig`, crate-local `Cargo.lock` and VCS metadata are
   dropped; the root manifest and lock are authoritative.
 - `src/wasm_store.c`: Wasmtime 36 represents a function's private handle as a
