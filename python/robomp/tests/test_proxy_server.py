@@ -933,6 +933,44 @@ async def test_git_push_head_drift(proxy_settings: Settings, upstream_repo: Path
     assert not _bare_has_branch(upstream_repo, branch)
 
 
+@pytest.mark.parametrize("repo", [r"C:\outside", r"\\server\share\outside"], ids=["windows-drive", "windows-unc"])
+async def test_git_push_rejects_windows_repo_before_filesystem_access(
+    proxy_settings: Settings, monkeypatch: pytest.MonkeyPatch, repo: str
+) -> None:
+    app = _build_app(proxy_settings)
+    body = json.dumps(
+        {
+            "repo": repo,
+            "workspace_key": repo + "__1",
+            "branch": "x",
+            "expected_head": "0" * 40,
+        }
+    ).encode()
+    original_stat = os.stat
+    workspace_root = Path(proxy_settings.workspace_root)
+
+    def reject_stat(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes] | int, *args: object, **kwargs: object
+    ) -> os.stat_result:
+        if not isinstance(path, int) and Path(os.fsdecode(path)).is_relative_to(workspace_root):
+            raise AssertionError("invalid repo must be rejected before workspace filesystem access")
+        return original_stat(path, *args, **kwargs)
+
+    async with await _async_client(app) as client:
+        # Trap workspace filesystem access at os.stat (also used directly by
+        # pathlib on Python 3.14), leaving unrelated framework paths alone.
+        with monkeypatch.context() as filesystem:
+            filesystem.setattr(os, "stat", reject_stat)
+            resp = await client.post(
+                "/gh/v1/git/push",
+                content=body,
+                headers={**_signed("POST", "/gh/v1/git/push", body), "Content-Type": "application/json"},
+            )
+
+    assert resp.status_code == 400, resp.text
+    assert "invalid repo" in resp.json()["detail"]
+
+
 async def test_git_push_workspace_key_mismatch(proxy_settings: Settings) -> None:
     app = _build_app(proxy_settings)
     body = (
@@ -948,7 +986,8 @@ async def test_git_push_workspace_key_mismatch(proxy_settings: Settings) -> None
     assert "workspace_key" in resp.text
 
 
-async def test_git_push_release_requires_hmac(proxy_settings: Settings) -> None:
+@pytest.mark.parametrize("endpoint", ["/gh/v1/git/push", "/gh/v1/git/push_release"])
+async def test_git_push_requires_hmac(proxy_settings: Settings, endpoint: str) -> None:
     app = _build_app(proxy_settings)
     body = json.dumps(
         {
@@ -961,7 +1000,7 @@ async def test_git_push_release_requires_hmac(proxy_settings: Settings) -> None:
     ).encode()
     async with await _async_client(app) as client:
         resp = await client.post(
-            "/gh/v1/git/push_release",
+            endpoint,
             content=body,
             headers={"Content-Type": "application/json"},
         )

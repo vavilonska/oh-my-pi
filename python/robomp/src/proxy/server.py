@@ -907,6 +907,7 @@ def create_proxy_app(settings: Settings) -> FastAPI:
     async def git_push_endpoint(request: Request) -> JSONResponse:
         data = await _json_body(request)
         repo = _require_str(data.get("repo"), "repo")
+        _validate_repo_name(repo)
         workspace_key = _require_str(data.get("workspace_key"), "workspace_key")
         branch = _require_branch(data.get("branch"))
         expected_head = _require_str(data.get("expected_head"), "expected_head")

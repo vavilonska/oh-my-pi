@@ -167,6 +167,9 @@ The integration test spawns a real `omp --mode rpc` against an
   refuses to start if it sees `GITHUB_TOKEN` in its own environment.
 - Orchestrator → gh-proxy is HMAC-SHA256 signed with a ±30s skew window
   and constant-time compare.
+- Both git push endpoints validate the `owner/repo` claim before workspace
+  lookup and require a matching workspace key prefix. Windows drive and UNC
+  repo claims return `400` even with a valid HMAC signature.
 - `git push` inside gh-proxy uses `git -c http.extraheader=…` with the
   token passed through an ephemeral process env var; the remote URL in
   `.git/config` stays token-free.
