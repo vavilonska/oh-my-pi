@@ -1,0 +1,25 @@
+name: CodeQL
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  swift-build:
+    name: Verify Swift scan toolchain
+    runs-on: xcode-27
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compile the real Foundation Models bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun swiftc -version
+          toolchain="$(bash crates/pi-natives/src/applefm/build-bridge.sh detect)"
+          test -n "$toolchain"
+          IFS=$'\t' read -r swiftc sdk fingerprint <<< "$toolchain"
+          printf '%s\n' "$fingerprint"
+          test "$(uname -m)" = arm64
+          bash crates/pi-natives/src/applefm/build-bridge.sh build "$RUNNER_TEMP/libomp_applefm.dylib" arm64 "$swiftc" "$sdk"
+          test -s "$RUNNER_TEMP/libomp_applefm.dylib"
