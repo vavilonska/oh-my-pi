@@ -51,5 +51,5 @@ rust_test(
         "noclippy",
         "norustfmt",
     ],
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True) + ["//crates/vendor/tree-sitter"],
 )

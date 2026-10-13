@@ -1,0 +1,39 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["Cargo.toml"])
+
+# Workspace member so registry consumers use a portable first-party label.
+# The Wasmtime build metadata supplies DEP_WASMTIME_C_API_INCLUDE.
+cargo_build_script(
+    name = "build_script",
+    srcs = ["binding_rust/build.rs"],
+    aliases = aliases(build = True),
+    crate_features = ["default", "std", "wasm"],
+    crate_root = "binding_rust/build.rs",
+    data = glob(["include/**", "src/**"]),
+    edition = "2021",
+    link_deps = ["@crates//:wasmtime-c-api-impl"],
+    links = "tree-sitter",
+    pkg_name = "tree-sitter",
+    tags = ["noclippy", "norustfmt"],
+    version = "0.25.10",
+    deps = all_crate_deps(build = True),
+)
+
+rust_library(
+    name = "tree-sitter",
+    srcs = glob(["binding_rust/*.rs"], exclude = ["binding_rust/build.rs"]),
+    aliases = aliases(),
+    compile_data = ["binding_rust/README.md", "src/parser.h"],
+    crate_features = ["default", "std", "wasm"],
+    crate_name = "tree_sitter",
+    crate_root = "binding_rust/lib.rs",
+    edition = "2021",
+    tags = ["noclippy", "norustfmt"],
+    version = "0.25.10",
+    deps = all_crate_deps(normal = True) + [":build_script"],
+)

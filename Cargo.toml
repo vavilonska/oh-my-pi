@@ -20,6 +20,7 @@ members = [
    "crates/vendor/brush-parser",
    "crates/vendor/cfg_aliases",
    "crates/vendor/napi",
+   "crates/vendor/tree-sitter",
    "crates/vendor/tree-sitter-go",
 ]
 resolver = "3"
@@ -46,6 +47,9 @@ napi = { path = "crates/vendor/napi" }
 # tree-sitter-go 0.25.0 (latest release) rejects Go 1.26 `new(expr)`; the
 # vendored copy carries the upstream grammar fix (see its README.md).
 tree-sitter-go = { path = "crates/vendor/tree-sitter-go" }
+# Keep tree-sitter's 0.25 API while upgrading its Wasmtime C API to the patched
+# 36.0.7 runtime; the vendored adapter no longer depends on private function IDs.
+tree-sitter = { path = "crates/vendor/tree-sitter" }
 
 [profile.release]
 opt-level = 3

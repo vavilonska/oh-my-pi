@@ -31,6 +31,8 @@ const VENDORED_FORK_EXCLUDES = [
 	"cfg_aliases",
 	"--exclude",
 	"napi",
+	"--exclude",
+	"tree-sitter",
 ] as const satisfies readonly string[];
 const TASK_COMMANDS = {
 	"check:rs": [

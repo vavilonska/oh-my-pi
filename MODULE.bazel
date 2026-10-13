@@ -219,6 +219,13 @@ crate.annotation(
     version = "0.28.0",
 )
 
+# Vendored tree-sitter preserves ast-grep's 0.25 API while patching Wasmtime.
+# Registry targets otherwise omit their workspace-local dependency edge.
+crate.annotation(
+    crate = "ast-grep-core",
+    deps = ["@@//crates/vendor/tree-sitter:tree-sitter"],
+)
+
 # Release addons must never pick up a host libpcre2 (Homebrew paths leaked into
 # shipped dylibs before); always build the vendored static copy.
 crate.annotation(

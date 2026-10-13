@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed `pwsh` code blocks rendering without PowerShell syntax colors ([#15008](https://github.com/can1357/oh-my-pi/issues/15008)).
+- Updated the WebAssembly grammar runtime to Wasmtime 36.0.7 to address 14 dependency security advisories while preserving the tree-sitter 0.25 API.
 
 ## [18.10.2] - 2026-10-12
 
