@@ -64,7 +64,10 @@ jobs:
           test -n "$toolchain"
           IFS=$'\t' read -r swiftc sdk fingerprint <<< "$toolchain"
           printf '%s\n' "$fingerprint"
-          test "$(uname -m)" = arm64
+          # CodeQL's x64 tracer can report x86_64 under Rosetta on an ARM host.
+          hardware_arm64="$(sysctl -n hw.optional.arm64)"
+          printf 'process architecture=%s hardware arm64=%s\n' "$(uname -m)" "$hardware_arm64"
+          test "$hardware_arm64" = 1
           bash crates/pi-natives/src/applefm/build-bridge.sh build "$RUNNER_TEMP/libomp_applefm.dylib" arm64 "$swiftc" "$sdk"
           test -s "$RUNNER_TEMP/libomp_applefm.dylib"
       - name: Perform CodeQL Analysis
