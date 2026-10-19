@@ -21,7 +21,11 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionEvent,
+	type IrcWakeTurnObservation,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
@@ -74,7 +78,7 @@ function createRef(sessionFile: string): AgentRef {
 	};
 }
 
-type IrcWakeObserver = (records: CustomMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined;
+type IrcWakeObserver = (records: CustomMessage[]) => IrcWakeTurnObservation | undefined;
 
 interface RevivedSessionHandle {
 	session: AgentSession;
@@ -843,7 +847,7 @@ describe("persisted subagent revival", () => {
 			timestamp: Date.now(),
 		};
 		const finish = observer?.([record]);
-		await finish?.();
+		await finish?.finish();
 		await terminal.promise;
 
 		expect(frames[0]).toMatchObject({
@@ -905,7 +909,7 @@ describe("persisted subagent revival", () => {
 		// A wake turn answering a hub message never calls yield; finalization must
 		// not clobber the authoritative completion artifact with a warning body.
 		const finish = observer?.([record]);
-		await finish?.();
+		await finish?.finish();
 
 		expect(await Bun.file(artifactPath).text()).toBe(completedReport);
 		AgentLifecycleManager.resetGlobalForTests();
@@ -964,7 +968,7 @@ describe("persisted subagent revival", () => {
 			expect(handle.trackedReplies).toHaveLength(1);
 			handle.setLastAssistantText("# Full table\n\n| tool | file |\n|---|---|\n| read | read.ts |");
 			const reply = IrcBus.global().wait("Main", { from: ref.id }, 5000);
-			await finish?.();
+			await finish?.finish();
 			await handle.trackedReplies[0];
 
 			expect(await reply).toMatchObject({
@@ -995,7 +999,7 @@ describe("persisted subagent revival", () => {
 				model: "some-model",
 			});
 			const reply = IrcBus.global().wait("Main", { from: ref.id }, 5000);
-			await finish?.();
+			await finish?.finish();
 			await handle.trackedReplies[0];
 
 			const msg = await reply;
@@ -1018,7 +1022,7 @@ describe("persisted subagent revival", () => {
 			const finish = observer?.([wakeRecord("Main")]);
 			handle.setLastAssistantStop({ stopReason: "aborted" });
 			const reply = IrcBus.global().wait("Main", { from: ref.id }, 5000);
-			await finish?.();
+			await finish?.finish();
 			await handle.trackedReplies[0];
 
 			const msg = await reply;
@@ -1041,7 +1045,7 @@ describe("persisted subagent revival", () => {
 			// answers its waker. Previously the relay dropped the empty body silently.
 			const finish = observer?.([wakeRecord("Main")]);
 			const reply = IrcBus.global().wait("Main", { from: ref.id }, 5000);
-			await finish?.();
+			await finish?.finish();
 			await handle.trackedReplies[0];
 
 			const msg = await reply;
@@ -1067,7 +1071,7 @@ describe("persisted subagent revival", () => {
 			expect((await answered)?.body).toBe("here you go");
 			handle.setLastAssistantText("Sent the table via hub.");
 			const duplicate = bus.wait("Main", { from: ref.id }, 200);
-			await finish?.();
+			await finish?.finish();
 			await handle.trackedReplies[0];
 
 			expect(await duplicate).toBeNull();
@@ -1105,7 +1109,7 @@ describe("persisted subagent revival", () => {
 			};
 			const finish = observer?.([relayRecord]);
 			handle.setLastAssistantText("No YOU hang up");
-			await finish?.();
+			await finish?.finish();
 			await handle.trackedReplies[0];
 
 			expect(delivered).toHaveLength(0);
@@ -1145,7 +1149,7 @@ describe("persisted subagent revival", () => {
 				provider: "some-provider",
 				model: "some-model",
 			});
-			await finish?.();
+			await finish?.finish();
 			await handle.trackedReplies[0];
 
 			expect(delivered).toHaveLength(2);
@@ -1171,7 +1175,7 @@ describe("persisted subagent revival", () => {
 			boom.stack = "boom while waking\n    at deepInternal (secret.ts:99:1)";
 			const finish = observer?.([wakeRecord("Main")]);
 			const reply = IrcBus.global().wait("Main", { from: ref.id }, 5000);
-			await finish?.(boom);
+			await finish?.finish(boom);
 			await handle.trackedReplies[0];
 
 			const msg = await reply;

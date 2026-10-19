@@ -526,9 +526,11 @@ describe("IRC", () => {
 			vi.spyOn(session, "refreshBaseSystemPrompt").mockResolvedValue(undefined);
 			const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
 			let observations = 0;
-			session.setIrcWakeTurnObserver(() => () => {
-				observations++;
-			});
+			session.setIrcWakeTurnObserver(() => ({
+				finish() {
+					observations++;
+				},
+			}));
 			await session.setWorkPoolYieldItems([{ id: "pool#1", index: 1 }]);
 			const queueDeferredWake = vi.spyOn(IrcBridge.prototype, "queueDeferredWake");
 			queueDeferredWake.mockClear();

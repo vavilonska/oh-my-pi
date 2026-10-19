@@ -8,7 +8,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
-import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
+import type { Api, AssistantMessage, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { isCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord, logger, popLoopPhase, prompt, pushLoopPhase, sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobError, AsyncJobManager, type AsyncJobRunResult } from "../async";
@@ -1203,6 +1203,7 @@ interface RunMonitorArgs {
 	id: string;
 	agent: AgentDefinition;
 	task: string;
+	structured: boolean;
 	assignment?: string;
 	description?: string;
 	/** Parent model registry for tiny-model label generation; absent → skip labeling. */
@@ -1400,6 +1401,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let budgetLimitExceeded = false;
 	let budgetStopRequested = false;
 	let budgetStopAbortPromise: Promise<void> | undefined;
+	// Irreversible monitor failures stay separate from request-scoped native recovery failures.
 	let terminalError: string | undefined;
 	let consecutiveYieldToolErrors = 0;
 	let lastAssistantSalvageText: string | undefined;
@@ -1409,6 +1411,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	// finalize the preceding report.
 	let lastReportTurnText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
+	/** Prose before the most recently consumed parent request is not that request's result. */
+	let assistantBeforeResult: AssistantMessage | undefined;
 
 	const abortActiveSession = (): Promise<void> => {
 		const session = activeSession;
@@ -2121,8 +2125,9 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			}
 
 			case "agent_end":
-				// Extract final content from assistant messages only (not user prompts)
-				if (event.messages && Array.isArray(event.messages)) {
+				// Structured output includes the whole run. Plain output is already
+				// captured at message_end, after its most recent parent-input boundary.
+				if (args.structured && event.messages && Array.isArray(event.messages)) {
 					for (const msg of event.messages) {
 						if ((msg as { role?: string })?.role !== "assistant") continue;
 						const messageContent = getMessageContent(msg);
@@ -2152,6 +2157,17 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	};
 
 	const attach = (session: AgentSession): (() => void) => {
+		assistantBeforeResult = session.getLastAssistantMessage();
+		const releaseOwnership = session.registerTaskRunMonitor(() => {
+			if (args.structured) return;
+			outputChunks.length = 0;
+			finalOutputChunks.length = 0;
+			lastReportTurnText = undefined;
+			// Only the prior request's recovery outcome is superseded, never a hard monitor failure/abort.
+			progress.retryFailure = undefined;
+			lastAssistantSalvageText = undefined;
+			assistantBeforeResult = session.getLastAssistantMessage();
+		});
 		// The session owns attribution: it knows which model produced its output
 		// and withholds an armed-but-unproven fallback. Re-deriving that here from
 		// the event stream got it wrong twice over — the stream also carries
@@ -2183,7 +2199,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			progress.contextWindow = contextWindow;
 			scheduleProgress(true);
 		};
-		return session.subscribe(event => {
+		const unsubscribe = session.subscribe(event => {
 			emitSubagentEvent(event);
 			publishAdvisorState(session);
 			publishServingModel();
@@ -2227,6 +2243,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 				}
 			}
 		});
+		return () => {
+			releaseOwnership();
+			unsubscribe();
+		};
 	};
 
 	const captureSalvage = (session: AgentSession): void => {
@@ -2234,7 +2254,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// cancelled/aborted children can surface "last activity" instead of
 		// "(no output)".
 		try {
-			const lastContent = session.getLastAssistantMessage()?.content;
+			const assistant = session.getLastAssistantMessage();
+			const lastContent = assistant !== assistantBeforeResult ? assistant?.content : undefined;
 			if (Array.isArray(lastContent)) {
 				const text = lastContent
 					.map(block => (block.type === "text" && typeof block.text === "string" ? block.text : ""))
@@ -2260,7 +2281,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		},
 		yieldAcceptedAt: () => yieldAcceptedAt,
 		runtimeLimitExceeded: () => runtimeLimitExceeded,
-		terminalError: () => terminalError,
+		terminalError: () => terminalError ?? progress.retryFailure?.errorMessage,
 		hasExplicitAbortReason: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -2714,7 +2735,11 @@ async function driveSessionToResult(
 			}
 		}
 	} finally {
-		error ??= monitor.terminalError();
+		const terminalError = monitor.terminalError();
+		if (terminalError) {
+			error ??= terminalError;
+			exitCode = 1;
+		}
 		if (abortSignal.aborted && (!monitor.yieldCalled() || monitor.runtimeLimitExceeded())) {
 			aborted = monitor.isAbortedRun();
 			if (aborted) {
@@ -3204,6 +3229,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				.filter(Boolean)
 				.join("\n\n") || "IRC follow-up";
 		const turnStartTime = Date.now();
+		let assistantBeforeTurn = session.getLastAssistantMessage();
 		const relay = Promise.withResolvers<void>();
 		session.trackIrcReply(relay.promise);
 		const sessionFile = AgentRegistry.global().get(id)?.sessionFile ?? options.sessionFile ?? undefined;
@@ -3245,6 +3271,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			id,
 			agent,
 			task: ircTask,
+			structured: options.structured !== false,
 			description: options.description,
 			modelOverride: options.modelOverride,
 			modelRole: options.modelRole,
@@ -3277,18 +3304,19 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 
 		turnMonitor.setActiveSession(session);
 		const unsubscribeTurn = turnMonitor.attach(session);
-		const ownerWoken = wakeSources(records, id).some(source => source.from === ownerId);
+		let ownerWoken = wakeSources(records, id).some(source => source.from === ownerId);
 		if (ownerWoken) registerWakeJob();
 		// A focused-session user prompt is the operator driving this agent (#14428):
 		// like a parent follow-up, its message-result reply is the agent's new result.
 		const userPrompted = records.some(record =>
 			record.role === "user" ? record.attribution === "user" : record.role === "developer" && record.userInitiated,
 		);
-		return async turnError => {
+		const finish = async (turnError?: unknown): Promise<void> => {
 			unsubscribeTurn();
 			const activeSession = turnMonitor.takeActiveSession();
-			if (activeSession) turnMonitor.captureSalvage(activeSession);
-			const lastAssistant = session.getLastAssistantMessage();
+			const latestAssistant = session.getLastAssistantMessage();
+			const lastAssistant = latestAssistant !== assistantBeforeTurn ? latestAssistant : undefined;
+			if (activeSession && lastAssistant) turnMonitor.captureSalvage(activeSession);
 			const yielded = turnMonitor.yieldCalled();
 			const runtimeLimitExceeded = turnMonitor.runtimeLimitExceeded();
 			const aborted = runtimeLimitExceeded || (lastAssistant?.stopReason === "aborted" && !yielded);
@@ -3302,6 +3330,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					: undefined;
 			const thrown = providerError === undefined && turnError !== undefined && !yielded ? turnError : undefined;
 			const error =
+				turnMonitor.terminalError() ??
 				providerError ??
 				(thrown instanceof Error
 					? thrown.stack || thrown.message
@@ -3309,6 +3338,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 						? undefined
 						: String(thrown));
 			const errorForPeer =
+				turnMonitor.terminalError() ??
 				providerError ??
 				(thrown instanceof Error ? thrown.message : thrown === undefined ? undefined : String(thrown));
 			turnMonitor.finish();
@@ -3365,7 +3395,9 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 			} finally {
 				// A user-driven message result is already complete: enqueue its
 				// delivery without reserving an execution slot (which may be full).
-				const messageResult = userPrompted && options.structured === false && result?.outputPath !== undefined;
+				const plainRequested = (ownerWoken || userPrompted) && options.structured === false;
+				const messageResult =
+					(ownerWoken || userPrompted) && options.structured === false && result?.outputPath !== undefined;
 				if (messageResult && !wakeJob && ownerId && session.asyncJobManager && result) {
 					const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
 					try {
@@ -3381,7 +3413,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 				// parent whatever it is: the yield result, the failure that
 				// superseded it, or, for a turn that never yielded, the answer a
 				// relay would have carried.
-				if (wakeJob && (yielded || messageResult) && result) {
+				if (wakeJob && (yielded || plainRequested) && result) {
 					const text = formatTaskResultSummary(result, { totalDurationMs: result.durationMs });
 					const structured = result.structuredOutput;
 					if (result.aborted || result.exitCode !== 0 || result.error !== undefined) {
@@ -3389,7 +3421,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					} else {
 						wakeJob.outcome.resolve(structured ? { text, structured } : { text });
 					}
-				} else if (wakeJob && yielded) {
+				} else if (wakeJob && (yielded || plainRequested)) {
 					const message = finalizeError instanceof Error ? finalizeError.message : String(finalizeError);
 					wakeJob.outcome.reject(new Error(`Wake turn of ${id} failed to finalize: ${message}`));
 				} else if (wakeJob) {
@@ -3432,6 +3464,17 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					relay.resolve();
 				}
 			}
+		};
+		return {
+			finish,
+			onInput(record) {
+				// Delivery alone is not ownership: the session calls this only once
+				// the original parent steer is consumed by the active turn.
+				if (!wakeSources([record], id).some(source => source.from === ownerId)) return;
+				if (options.structured === false) assistantBeforeTurn = session.getLastAssistantMessage();
+				ownerWoken = true;
+				registerWakeJob();
+			},
 		};
 	});
 }
@@ -3672,6 +3715,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		id,
 		agent,
 		task: message,
+		structured: options.structured !== false,
 		description: options.description,
 		modelRole: options.modelRole,
 		signal,
@@ -4163,6 +4207,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		id,
 		agent,
 		task,
+		structured: options.structured !== false,
 		assignment,
 		description: options.description,
 		modelRegistry: options.modelRegistry,

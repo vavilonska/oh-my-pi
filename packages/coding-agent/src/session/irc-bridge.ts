@@ -31,6 +31,8 @@ export class IrcBridge {
 	#deferredWakes: AgentMessage[] = [];
 	/** In-flight wake-turn relays owed to peers. */
 	readonly #pendingReplies = new Set<Promise<void>>();
+	/** Trusted provenance for parent steering, retained until the loop consumes the original message. */
+	readonly #parentSteers = new WeakMap<AgentMessage, CustomMessage>();
 
 	constructor(host: IrcBridgeHost) {
 		this.#host = host;
@@ -177,6 +179,13 @@ export class IrcBridge {
 		return messages;
 	}
 
+	/** Claims the IRC source only when its steering message actually enters the transcript. */
+	takeParentSteer(message: AgentMessage): CustomMessage | undefined {
+		const record = this.#parentSteers.get(message);
+		this.#parentSteers.delete(message);
+		return record;
+	}
+
 	/** Delivers an IRC message into the recipient session without awaiting any wake turn. */
 	async deliver(msg: IrcMessage): Promise<"injected" | "woken"> {
 		if (this.#host.isDisposed()) throw new Error("Recipient session is disposed.");
@@ -217,13 +226,15 @@ export class IrcBridge {
 		void this.#host.emitSessionEvent({ type: "irc_message", message: record });
 		if (streaming) {
 			if (fromParent) {
-				this.#host.agent.steer({
+				const steering: AgentMessage = {
 					role: "user",
 					content: prompt.render(parentIrcSteerTemplate, { from: msg.from, message: envelopeBody }),
 					attribution: "agent",
 					timestamp: msg.ts,
 					steering: true,
-				});
+				};
+				if (msg.wakeRelay !== true) this.#parentSteers.set(steering, record);
+				this.#host.agent.steer(steering);
 			} else {
 				this.#interrupts.push(record);
 			}

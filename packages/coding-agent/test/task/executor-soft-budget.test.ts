@@ -12,7 +12,12 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { registerPersistedSubagents } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type {
+	AgentSession,
+	AgentSessionEvent,
+	IrcWakeTurnObservation,
+	PromptOptions,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { buildBudgetNotice, resolveSoftRequestBudget, runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -68,7 +73,7 @@ function createMockSession(
 	let disposeCount = 0;
 	let promptIndex = 0;
 	let ircWakeTurnObserver:
-		| ((records: CustomMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
+		| ((records: CustomMessage[]) => IrcWakeTurnObservation | undefined)
 		| undefined;
 
 	const emit = (event: AgentSessionEvent) => {
@@ -143,7 +148,7 @@ function createMockSession(
 				isError: false,
 			} as AgentSessionEvent);
 			emit({ type: "agent_end", messages: [yieldMessage] } as unknown as AgentSessionEvent);
-			await finishObservation?.();
+			await finishObservation?.finish();
 			return "woken";
 		},
 		abort: async () => {

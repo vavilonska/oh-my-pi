@@ -1541,9 +1541,11 @@ describe("AgentSession aside delivery", () => {
 				({ signal }) => untilAborted(signal, gate.promise).then(() => "build ok"),
 				{ id: "wake-job", ownerId: "SubAgent" },
 			);
-			return async () => {
-				events.push("observer-finish");
-				observerFinished.resolve();
+			return {
+				finish() {
+					events.push("observer-finish");
+					observerFinished.resolve();
+				},
 			};
 		});
 
@@ -1621,9 +1623,11 @@ describe("AgentSession aside delivery", () => {
 				({ signal }) => untilAborted(signal, gate.promise).then(() => "build ok"),
 				{ id: "wake-job", ownerId: "SubAgent" },
 			);
-			return async () => {
-				events.push("observer-finish");
-				observerFinished.resolve();
+			return {
+				finish() {
+					events.push("observer-finish");
+					observerFinished.resolve();
+				},
 			};
 		});
 

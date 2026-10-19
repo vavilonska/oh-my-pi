@@ -7,6 +7,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
@@ -17,19 +19,29 @@ import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import {
+	AgentSession,
+	type AgentSessionEvent,
+	type IrcWakeTurnObservation,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	attachIrcWakeTurnMonitor,
 	runSubagentFollowUpTurn,
 	runSubprocess,
 } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { WorkPool } from "@oh-my-pi/pi-coding-agent/task/workpool";
+import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WaitTool } from "@oh-my-pi/pi-coding-agent/tools/wait";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, untilAborted } from "@oh-my-pi/pi-utils";
+import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 
 const AGENT_ID = "accepted-result";
 
@@ -70,7 +82,7 @@ interface SessionHarness {
 	emitAssistantText: (text: string) => void;
 	/** The observer factory installed by {@link attachIrcWakeTurnMonitor}, if any. */
 	wakeObserver: () =>
-		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
+		| ((records: AgentMessage[]) => IrcWakeTurnObservation | undefined)
 		| undefined;
 }
 
@@ -86,7 +98,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 	const promptEntered = Promise.withResolvers<void>();
 	const hangingPrompt = Promise.withResolvers<void>();
 	let yieldSeq = 0;
-	let wakeObserver: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined;
+	let wakeObserver: ((records: AgentMessage[]) => IrcWakeTurnObservation | undefined) | undefined;
 	const emit = (event: AgentSessionEvent) => {
 		// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 		for (const listener of [...listeners]) listener(event);
@@ -119,6 +131,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		getToolByName: () => undefined,
 		setActiveToolsByName: async () => {},
 		setWorkPoolYieldItems: () => {},
+		registerTaskRunMonitor: () => () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
 			return () => {
@@ -147,7 +160,7 @@ function createHarness(options?: { hangPrompt?: boolean; asyncJobManager?: Async
 		abort: async () => {},
 		dispose: async () => {},
 		setIrcWakeTurnObserver: (
-			observer: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined,
+			observer: ((records: AgentMessage[]) => IrcWakeTurnObservation | undefined) | undefined,
 		) => {
 			wakeObserver = observer;
 		},
@@ -176,6 +189,123 @@ function registerRunning(session: AgentSession) {
 
 async function flushMicrotasks(): Promise<void> {
 	for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+}
+
+/** Real session/IRC/agent-loop entrypoints; only the provider responses are scripted. */
+async function createLiveWakeHarness(responses: MockResponseSource, structured = false) {
+	const tempDir = TempDir.createSync("@omp-injected-wake-");
+	const artifactsDir = tempDir.path();
+	const authStorage = await AuthStorage.create(":memory:");
+	authStorage.keys.setRuntime("openai", "test-key");
+	const mock = createMockModel({ provider: "openai", id: "gpt-test", responses });
+	const manager = new AsyncJobManager({});
+	const settings = Settings.isolated({
+		"compaction.enabled": false,
+		"retry.enabled": false,
+		"todo.enabled": false,
+		"advisor.enabled": false,
+		"launch.enabled": false,
+		"task.maxConcurrency": 1,
+		"task.maxRuntimeMs": 0,
+		"eval.workpool.freshAgents": false,
+	});
+	settings.setModelRole("default", `${mock.model.provider}/${mock.model.id}`);
+	const liveSession: { current?: AgentSession } = {};
+	const tools: AgentTool[] = structured
+		? [
+				new YieldTool({
+					cwd: artifactsDir,
+					settings,
+					hasUI: false,
+					getSessionFile: () => null,
+					getSessionSpawns: () => "*",
+					getWorkPoolYieldItems: () => liveSession.current?.getWorkPoolYieldItems() ?? [],
+				}),
+			]
+		: [];
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: { model: mock.model, systemPrompt: ["Test"], tools, messages: [] },
+		convertToLlm,
+		streamFn: mock.stream,
+	});
+	const session = new AgentSession({
+		agent,
+		sessionManager: SessionManager.inMemory(artifactsDir),
+		settings,
+		modelRegistry: new ModelRegistry(authStorage),
+		toolRegistry: new Map(tools.map(tool => [tool.name, tool])),
+		agentId: AGENT_ID,
+		ownedAsyncJobManager: manager,
+	});
+	liveSession.current = session;
+	session.sessionManager.getArtifactsDir = () => artifactsDir;
+	const registry = AgentRegistry.global();
+	const parentMessages: string[] = [];
+	const parentSession = createHarness().session;
+	parentSession.sessionManager.getArtifactsDir = () => artifactsDir;
+	registry.register({
+		id: "Parent",
+		displayName: "Parent",
+		kind: "main",
+		session: Object.assign(parentSession, {
+			deliverIrcMessage: async (message: IrcMessage) => {
+				parentMessages.push(message.body);
+				return "injected" as const;
+			},
+		}),
+		status: "running",
+	});
+	registry.register({
+		id: AGENT_ID,
+		displayName: AGENT_ID,
+		kind: "sub",
+		parentId: "Parent",
+		session,
+		status: "idle",
+	});
+	attachIrcWakeTurnMonitor(session, { id: AGENT_ID, agent: baseAgent, structured, artifactsDir });
+	const accepted = '{"report":"accepted verdict"}';
+	await Bun.write(path.join(artifactsDir, `${AGENT_ID}.md`), accepted);
+	await Bun.write(path.join(artifactsDir, `${AGENT_ID}.json`), accepted);
+	const delivered: string[] = [];
+	manager.registerDeliverySink("Parent", (_jobId, text) => {
+		delivered.push(text);
+	});
+	const parent = {
+		cwd: artifactsDir,
+		settings,
+		agentRegistry: registry,
+		asyncJobManager: manager,
+		getAgentId: () => "Parent",
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+	} as unknown as ToolSession;
+	return {
+		session,
+		manager,
+		mock,
+		parent,
+		artifactsDir,
+		parentMessages,
+		delivered,
+		accepted,
+		artifact: () => Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text(),
+		sidecar: () => Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text(),
+		sidecarExists: () => Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).exists(),
+		send: (from: string, body: string) => IrcBus.global().send({ from, to: AGENT_ID, body }),
+		async dispose() {
+			await session.abort();
+			await session.waitForIdle();
+			await session.waitForIrcReplies();
+			await session.dispose();
+			await manager.dispose({ timeoutMs: 1000 });
+			authStorage.close();
+			InternalUrlRouter.resetForTests();
+			resetRegisteredArtifactDirsForTests();
+			tempDir.removeSync();
+		},
+	};
 }
 
 describe("runSubprocess result acceptance", () => {
@@ -306,7 +436,7 @@ describe("runSubprocess result acceptance", () => {
 		]);
 		expect(finish).toBeDefined();
 		harness.emitTerminalYield({ report: "answered while woken" });
-		await finish?.(undefined);
+		await finish?.finish(undefined);
 
 		const settled = AgentRegistry.global().get(AGENT_ID);
 		expect(settled?.status).not.toBe("running");
@@ -350,7 +480,7 @@ describe("runSubprocess result acceptance", () => {
 				harness.emitTerminalYield({ report });
 				// Pending from acceptance until finalization: the parent's `wait` can block on it.
 				expect(manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([AGENT_ID]);
-				await finish?.(undefined);
+				await finish?.finish(undefined);
 				await manager.waitForAll();
 				await manager.drainDeliveries({ timeoutMs: 1000 });
 			}
@@ -409,7 +539,7 @@ describe("runSubprocess result acceptance", () => {
 				} as unknown as AgentMessage,
 			]);
 			harness.emitAssistantText('{"reports":[{"verdict":"round-2"}]}');
-			await finish?.(undefined);
+			await finish?.finish(undefined);
 			AgentRegistry.global().setStatus(AGENT_ID, "idle");
 
 			const resolved = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
@@ -462,7 +592,7 @@ describe("runSubprocess result acceptance", () => {
 				} as unknown as AgentMessage,
 			]);
 			harness.emitAssistantText("line 42 is fine");
-			await finish?.(undefined);
+			await finish?.finish(undefined);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
 		} finally {
@@ -507,7 +637,7 @@ describe("runSubprocess result acceptance", () => {
 				},
 			]);
 			harness.emitAssistantText("## Report\nroot cause found");
-			await finish?.(undefined);
+			await finish?.finish(undefined);
 			expect(manager.atCapacity).toBe(true);
 			await manager.drainDeliveries({ timeoutMs: 1000 });
 			AgentRegistry.global().setStatus(AGENT_ID, "idle");
@@ -561,7 +691,7 @@ describe("runSubprocess result acceptance", () => {
 			]);
 			harness.emitAssistantText("cancelled answer");
 			expect(manager.cancel(AGENT_ID)).toBe(true);
-			await finish?.(undefined);
+			await finish?.finish(undefined);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.md`)).text()).toBe(accepted);
 			expect(await Bun.file(path.join(artifactsDir, `${AGENT_ID}.json`)).text()).toBe(accepted);
 		} finally {
@@ -653,7 +783,7 @@ describe("runSubprocess result acceptance", () => {
 				}
 				const waiting = new WaitTool(parent).execute("parent-wait", {});
 				// No yield or assistant prose: only the optional IRC message above.
-				await finish?.(undefined);
+				await finish?.finish(undefined);
 				const result = await waiting;
 				const job = result.details?.jobs?.[0];
 				expect(job?.status).toBe("completed");
@@ -707,7 +837,7 @@ describe("runSubprocess result acceptance", () => {
 			const waiting = new WaitTool(parent).execute("parent-wait", {});
 			// A conversational answer: the turn ends without a yield.
 			harness.emitAssistantText("mask path fixed too");
-			await finish?.(undefined);
+			await finish?.finish(undefined);
 
 			const result = await waiting;
 			expect(result.details?.jobs?.[0]).toMatchObject({
@@ -720,5 +850,489 @@ describe("runSubprocess result acceptance", () => {
 		} finally {
 			await manager.dispose({ timeoutMs: 1000 });
 		}
+	});
+	describe("real IRC wake result publication", () => {
+		it("publishes a normal idle parent wake once through automatic job delivery", async () => {
+			const harness = await createLiveWakeHarness([{ content: ['{"report":"parent wake result"}'] }]);
+			try {
+				expect((await harness.send("Parent", "report the revised result")).outcome).toBe("woken");
+				await harness.session.waitForIdle();
+				await harness.session.waitForIrcReplies();
+				await harness.manager.waitForAll();
+				await harness.manager.drainDeliveries({ timeoutMs: 1000 });
+				expect(await harness.artifact()).toBe('{"report":"parent wake result"}');
+				expect(await harness.sidecarExists()).toBe(false);
+				expect(harness.delivered).toHaveLength(1);
+				expect(harness.delivered[0]).toContain("parent wake result");
+				expect(harness.parentMessages).toEqual([]);
+				expect(harness.manager.getRecentJobs(10, { ownerId: "Parent" })).toHaveLength(1);
+			} finally {
+				await harness.dispose();
+			}
+		});
+
+		it("keeps the accepted artifact and sidecar after a peer-only conversational wake", async () => {
+			const harness = await createLiveWakeHarness([{ content: ["peer conversation only"] }]);
+			try {
+				expect((await harness.send("Peer", "is the helper fine?")).outcome).toBe("woken");
+				await harness.session.waitForIdle();
+				await harness.session.waitForIrcReplies();
+				expect(await harness.artifact()).toBe(harness.accepted);
+				expect(await harness.sidecar()).toBe(harness.accepted);
+				expect(harness.manager.getRunningJobs({ ownerId: "Parent" })).toEqual([]);
+				expect(harness.manager.getRecentJobs(10, { ownerId: "Parent" })).toEqual([]);
+				expect(harness.delivered).toEqual([]);
+			} finally {
+				await harness.dispose();
+			}
+		});
+
+		it.each(["peer", "queued", "async"] as const)(
+			"adopts consumed parent steers in a %s turn and lets native wait consume exactly one completion",
+			async entry => {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const consumed = Promise.withResolvers<void>();
+				const finish = Promise.withResolvers<void>();
+				const harness = await createLiveWakeHarness([
+					async () => {
+						entered.resolve();
+						await release.promise;
+						return { content: ["earlier conversation"] };
+					},
+					async () => {
+						consumed.resolve();
+						await finish.promise;
+						return { content: ["processing the first parent request"] };
+					},
+					// Steering defaults to one-at-a-time: the second parent input
+					// is consumed by another provider call in this same observed run.
+					{ content: ['{"report":"injected parent result"}'] },
+				]);
+				try {
+					if (entry === "peer") {
+						expect((await harness.send("Peer", "check the helper")).outcome).toBe("woken");
+					} else if (entry === "queued") {
+						await harness.session.steer("continue the peer discussion", undefined, { attribution: "agent" });
+					} else {
+						harness.manager.register("bash", "completed build", async () => "build finished", {
+							id: "build-result",
+							ownerId: AGENT_ID,
+						});
+					}
+					await entered.promise;
+					expect((await harness.send("Parent", "report the final revision")).outcome).toBe("injected");
+					expect((await harness.send("Parent", "include the conclusion")).outcome).toBe("injected");
+					// Receipt is not consumption: an already-stopped response must not
+					// acquire a job/result just because the steer reached its queue.
+					expect(harness.manager.getRunningJobs({ ownerId: "Parent" })).toEqual([]);
+					expect(await harness.artifact()).toBe(harness.accepted);
+					release.resolve();
+					await consumed.promise;
+					expect(JSON.stringify(harness.mock.calls[1]?.context.messages)).toContain("report the final revision");
+					expect(harness.manager.getRunningJobs({ ownerId: "Parent" }).map(job => job.agentId)).toEqual([
+						AGENT_ID,
+					]);
+					const waiting = new WaitTool(harness.parent).execute("parent-wait", {});
+					finish.resolve();
+					const result = await waiting;
+					expect(harness.mock.calls).toHaveLength(3);
+					expect(JSON.stringify(harness.mock.calls[2]?.context.messages)).toContain("include the conclusion");
+					expect(result.details?.jobs).toHaveLength(1);
+					const job = result.details?.jobs?.[0];
+					expect(job?.status).toBe("completed");
+					expect(job?.resultText).toContain("injected parent result");
+					await harness.session.waitForIdle();
+					await harness.session.waitForIrcReplies();
+					await harness.manager.drainDeliveries({ timeoutMs: 1000 });
+					expect(await harness.artifact()).toContain("injected parent result");
+					expect(await harness.artifact()).not.toContain("accepted verdict");
+					const read = await InternalUrlRouter.instance().resolve(`agent://${AGENT_ID}`);
+					expect(read.content).toContain("injected parent result");
+					expect(harness.manager.getRecentJobs(10, { ownerId: "Parent" })).toHaveLength(1);
+					expect(harness.manager.isJobResultConsumed(job!.id)).toBe(true);
+					expect(harness.delivered).toEqual([]);
+					expect(harness.parentMessages).toEqual([]);
+					await expect(new WaitTool(harness.parent).execute("no-duplicate", {})).rejects.toThrow(
+						"Nothing to wait for",
+					);
+				} finally {
+					release.resolve();
+					finish.resolve();
+					await harness.dispose();
+				}
+			},
+		);
+
+		it("cancels the adopted parent turn without replacing accepted results or cancelling its successor", async () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const consumed = Promise.withResolvers<void>();
+			const successor = Promise.withResolvers<void>();
+			const finishSuccessor = Promise.withResolvers<void>();
+			const harness = await createLiveWakeHarness([
+				async () => {
+					entered.resolve();
+					await release.promise;
+					return { content: ["previous conversation"] };
+				},
+				() => {
+					consumed.resolve();
+					return { content: ["cancelled replacement"], delayMs: 60_000 };
+				},
+				async () => {
+					successor.resolve();
+					await finishSuccessor.promise;
+					return { content: ["successor result"] };
+				},
+			]);
+			try {
+				await harness.session.steer("resume discussion", undefined, { attribution: "agent" });
+				await entered.promise;
+				expect((await harness.send("Parent", "inspect the revision")).outcome).toBe("injected");
+				release.resolve();
+				await consumed.promise;
+				const [job] = harness.manager.getRunningJobs({ ownerId: "Parent" });
+				expect(job).toBeDefined();
+				const waiting = new WaitTool(harness.parent).execute("cancelled-parent-wait", {});
+				expect(harness.manager.cancel(job!.id)).toBe(true);
+				const cancelled = await waiting;
+				expect(cancelled.details?.jobs?.[0]?.status).not.toBe("completed");
+				await harness.session.waitForIdle();
+				await harness.session.waitForIrcReplies();
+				expect(harness.session.agent.state.isStreaming).toBe(false);
+				expect(await harness.artifact()).toBe(harness.accepted);
+				expect(await harness.sidecar()).toBe(harness.accepted);
+
+				expect((await harness.send("Parent", "run a fresh revision")).outcome).toBe("woken");
+				await successor.promise;
+				const [nextJob] = harness.manager.getRunningJobs({ ownerId: "Parent" });
+				expect(nextJob?.id).not.toBe(job!.id);
+				expect(harness.manager.cancel(job!.id)).toBe(false);
+				const nextWait = new WaitTool(harness.parent).execute("successor-wait", {});
+				finishSuccessor.resolve();
+				expect((await nextWait).details?.jobs?.[0]?.status).toBe("completed");
+				await harness.session.waitForIrcReplies();
+				expect(await harness.artifact()).toBe("successor result");
+				expect(harness.parentMessages).toEqual([]);
+			} finally {
+				release.resolve();
+				finishSuccessor.resolve();
+				await harness.dispose();
+			}
+		});
+
+		it("reports a consumed parent request's provider failure instead of accepting prior assistant prose", async () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const harness = await createLiveWakeHarness([
+				async () => {
+					entered.resolve();
+					await release.promise;
+					return { content: ["old peer answer"] };
+				},
+				{ stopReason: "error", errorMessage: "synthetic provider failure", content: [] },
+			]);
+			try {
+				await harness.session.steer("resume discussion", undefined, { attribution: "agent" });
+				await entered.promise;
+				expect((await harness.send("Parent", "finish the report")).outcome).toBe("injected");
+				release.resolve();
+				await harness.session.waitForIdle();
+				await harness.session.waitForIrcReplies();
+				await harness.manager.waitForAll();
+				await harness.manager.drainDeliveries({ timeoutMs: 1000 });
+				const [job] = harness.manager.getRecentJobs(10, { ownerId: "Parent" });
+				expect(job?.status).toBe("failed");
+				expect(harness.delivered).toHaveLength(1);
+				expect(harness.delivered[0]).toContain("synthetic provider failure");
+				expect(await harness.artifact()).toBe(harness.accepted);
+				expect(await harness.sidecar()).toBe(harness.accepted);
+			} finally {
+				release.resolve();
+				await harness.dispose();
+			}
+		});
+
+		it.each(["follow-up", "pooled"] as const)(
+			"keeps an executor-owned %s turn on its native completion when it consumes a parent steer",
+			async entry => {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const consumed = Promise.withResolvers<void>();
+				const finish = Promise.withResolvers<void>();
+				const pooled = entry === "pooled";
+				const harness = await createLiveWakeHarness(
+					[
+						async () => {
+							entered.resolve();
+							await release.promise;
+							return { content: ["prior assignment narration"] };
+						},
+						async () => {
+							consumed.resolve();
+							await finish.promise;
+							return pooled
+								? {
+										content: [
+											{
+												type: "toolCall" as const,
+												id: "pooled-result",
+												name: "yield",
+												arguments: { key: 1, data: { report: "native pooled result" } },
+											},
+										],
+									}
+								: { content: ["native follow-up result"] };
+						},
+					],
+					pooled,
+				);
+				try {
+					let pool: WorkPool | undefined;
+					if (pooled) {
+						pool = new WorkPool(harness.parent, {
+							name: "owned-pool",
+							policy: {
+								discovery: { agents: [baseAgent], projectAgentsDir: null },
+								agentName: baseAgent.name,
+								agent: baseAgent,
+								effectiveAgent: baseAgent,
+								structured: true,
+								schema: {
+									schema: undefined,
+									source: "none",
+									mode: "permissive",
+									outputSchemaOverridesAgent: false,
+								},
+								planMode: false,
+								isIsolated: false,
+								mergeMode: "patch",
+								applyChanges: true,
+								enableLsp: false,
+								enableIrc: true,
+							},
+						});
+						// Start with the kept-alive worker's first batch already
+						// accepted; push must run the real second-batch path.
+						pool.agents.push({ id: AGENT_ID, index: 1, state: "idle", queue: [], turns: 1 });
+						pool.push(["review the next item"]);
+					} else {
+						harness.manager.register(
+							"task",
+							"explicit follow-up",
+							async ({ signal }) => {
+								const result = await runSubagentFollowUpTurn({
+									id: AGENT_ID,
+									agent: baseAgent,
+									message: "review the next revision",
+									structured: false,
+									artifactsDir: harness.artifactsDir,
+									signal,
+								});
+								if (result.exitCode !== 0 || result.error) throw new Error(result.error ?? result.output);
+								return { text: result.output };
+							},
+							{ id: "native-follow-up", agentId: AGENT_ID, ownerId: "Parent" },
+						);
+					}
+					await entered.promise;
+					expect((await harness.send("Parent", "include the latest revision")).outcome).toBe("injected");
+					release.resolve();
+					await consumed.promise;
+					const jobs = harness.manager.getRunningJobs({ ownerId: "Parent" });
+					expect(jobs.map(job => job.id).sort()).toEqual(
+						pooled ? [`${AGENT_ID}-b2`, "owned-pool"].sort() : ["native-follow-up"],
+					);
+					expect(harness.manager.getJob(AGENT_ID)).toBeUndefined();
+					expect(JSON.stringify(harness.mock.calls[1]?.context.messages)).toContain("include the latest revision");
+					finish.resolve();
+					await harness.manager.waitForAll();
+					await harness.session.waitForIdle();
+					await harness.session.waitForIrcReplies();
+					await harness.manager.drainDeliveries({ timeoutMs: 1000 });
+					expect(harness.delivered).toHaveLength(1);
+					expect(harness.delivered[0]).toContain(pooled ? "native pooled result" : "native follow-up result");
+					expect(harness.manager.getJob(AGENT_ID)).toBeUndefined();
+					expect(harness.parentMessages).toEqual([]);
+					if (pool) {
+						expect(pool.items[0]?.status).toBe("completed");
+						expect(pool.agents[0]?.turns).toBe(2);
+					} else {
+						expect(await harness.artifact()).toBe("native follow-up result");
+					}
+				} finally {
+					release.resolve();
+					finish.resolve();
+					await harness.dispose();
+				}
+			},
+		);
+
+		it("fails an injected parent request after empty-stop recovery without republishing earlier peer prose", async () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const consumed = Promise.withResolvers<void>();
+			const empty = Promise.withResolvers<void>();
+			const responses: MockResponseSource = (function* () {
+				yield async () => {
+					entered.resolve();
+					await release.promise;
+					return { content: ["old peer report must not become the parent result"] };
+				};
+				yield async () => {
+					consumed.resolve();
+					await empty.promise;
+					return { content: [], stopReason: "stop" as const };
+				};
+				// The native recovery cap, not a short script or provider exception,
+				// must terminalize the repeated empty responses.
+				while (true) yield { content: [], stopReason: "stop" as const };
+			})();
+			const harness = await createLiveWakeHarness(responses);
+			try {
+				expect((await harness.send("Peer", "review the old revision")).outcome).toBe("woken");
+				await entered.promise;
+				expect((await harness.send("Parent", "report on the new revision")).outcome).toBe("injected");
+				release.resolve();
+				await consumed.promise;
+				const waiting = new WaitTool(harness.parent).execute("empty-stop-parent-wait", {});
+				empty.resolve();
+				const result = await waiting;
+				expect(result.details?.jobs).toHaveLength(1);
+				expect(result.details?.jobs?.[0]?.status).toBe("failed");
+				expect(result.details?.jobs?.[0]?.errorText).toContain("empty stop after retry cap");
+				await harness.session.waitForIdle();
+				await harness.session.waitForIrcReplies();
+				expect(harness.mock.calls.length).toBeGreaterThan(2);
+				expect(await harness.artifact()).toBe(harness.accepted);
+				expect(await harness.sidecar()).toBe(harness.accepted);
+				expect(harness.delivered).toEqual([]);
+				expect(harness.parentMessages).toEqual([]);
+			} finally {
+				release.resolve();
+				empty.resolve();
+				await harness.dispose();
+			}
+		});
+
+		it("publishes a fresh parent result after a peer recovery failure while owned async work keeps the observation open", async () => {
+			const capped = Promise.withResolvers<string | undefined>();
+			const childWork = Promise.withResolvers<string>();
+			const continuationEntered = Promise.withResolvers<void>();
+			const releaseContinuation = Promise.withResolvers<void>();
+			const parentConsumed = Promise.withResolvers<void>();
+			const finish = Promise.withResolvers<void>();
+			let asyncPhase = false;
+			const responses: MockResponseSource = (function* () {
+				while (!asyncPhase) yield { content: [], stopReason: "stop" as const };
+				yield async () => {
+					continuationEntered.resolve();
+					await releaseContinuation.promise;
+					return { content: ["async update before the parent request"] };
+				};
+				yield async () => {
+					parentConsumed.resolve();
+					await finish.promise;
+					return { content: ["fresh parent result after recovery failure"] };
+				};
+			})();
+			const harness = await createLiveWakeHarness(responses);
+			harness.session.subscribe(event => {
+				if (event.type === "auto_retry_end" && !event.success) capped.resolve(event.finalError);
+			});
+			harness.manager.register(
+				"bash",
+				"child work",
+				({ signal }) => untilAborted(signal, childWork.promise),
+				{ id: "child-work", ownerId: AGENT_ID },
+			);
+			try {
+				expect((await harness.send("Peer", "review the earlier revision")).outcome).toBe("woken");
+				expect(await capped.promise).toContain("empty stop after retry cap");
+				await harness.session.waitForIdle();
+				expect(await harness.artifact()).toBe(harness.accepted);
+				expect(await harness.sidecar()).toBe(harness.accepted);
+				expect(harness.manager.getRunningJobs({ ownerId: AGENT_ID })).toHaveLength(1);
+				asyncPhase = true;
+				childWork.resolve("child work finished");
+				await continuationEntered.promise;
+				expect((await harness.send("Parent", "report the fresh revision")).outcome).toBe("injected");
+				releaseContinuation.resolve();
+				await parentConsumed.promise;
+				const waiting = new WaitTool(harness.parent).execute("fresh-parent-wait", {});
+				finish.resolve();
+				const result = await waiting;
+				expect(result.details?.jobs).toHaveLength(1);
+				expect(result.details?.jobs?.[0]?.status).toBe("completed");
+				expect(result.details?.jobs?.[0]?.resultText).toContain("fresh parent result after recovery failure");
+				expect(result.details?.jobs?.[0]?.errorText).toBeUndefined();
+				await harness.session.waitForIdle();
+				await harness.session.waitForIrcReplies();
+				expect(await harness.artifact()).toBe("fresh parent result after recovery failure");
+				expect(await harness.sidecarExists()).toBe(false);
+				expect(harness.delivered).toEqual([]);
+				expect(harness.parentMessages).toEqual([]);
+			} finally {
+				asyncPhase = true;
+				childWork.resolve("child work finished");
+				releaseContinuation.resolve();
+				finish.resolve();
+				await harness.dispose();
+			}
+		});
+
+		it("retains the monitor's irreversible invalid-yield failure after consuming a parent request", async () => {
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const consumed = Promise.withResolvers<void>();
+			const continueErrors = Promise.withResolvers<void>();
+			let sequence = 0;
+			const invalidYield = () => ({
+				content: [
+					{
+						type: "toolCall" as const,
+						name: "yield",
+						arguments: { data: { report: `invalid-${++sequence}` }, error: "conflicting failure" },
+					},
+				],
+			});
+			const responses: MockResponseSource = (function* () {
+				yield async () => {
+					entered.resolve();
+					await release.promise;
+					return invalidYield();
+				};
+				yield async () => {
+					consumed.resolve();
+					await continueErrors.promise;
+					return invalidYield();
+				};
+				while (true) yield invalidYield();
+			})();
+			const harness = await createLiveWakeHarness(responses, true);
+			try {
+				expect((await harness.send("Peer", "review the patch")).outcome).toBe("woken");
+				await entered.promise;
+				expect((await harness.send("Parent", "finish the report")).outcome).toBe("injected");
+				release.resolve();
+				await consumed.promise;
+				const waiting = new WaitTool(harness.parent).execute("hard-failure-parent-wait", {});
+				continueErrors.resolve();
+				const result = await waiting;
+				expect(result.details?.jobs).toHaveLength(1);
+				expect(result.details?.jobs?.[0]?.status).toBe("failed");
+				expect(result.details?.jobs?.[0]?.errorText).toContain("invalid yield results");
+				await harness.session.waitForIdle();
+				await harness.session.waitForIrcReplies();
+				expect(await harness.artifact()).toBe(harness.accepted);
+				expect(await harness.sidecar()).toBe(harness.accepted);
+				expect(harness.delivered).toEqual([]);
+			} finally {
+				release.resolve();
+				continueErrors.resolve();
+				await harness.dispose();
+			}
+		});
 	});
 });

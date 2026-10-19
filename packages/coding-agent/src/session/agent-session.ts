@@ -702,13 +702,21 @@ type AgentContinueOutcome =
  */
 type PromptDispatchOutcome = { sessionClaimed: boolean };
 
+/** Task-executor monitoring attached to one session turn, including inputs consumed mid-turn. */
+export interface IrcWakeTurnObservation {
+	finish(error?: unknown): void | Promise<void>;
+	onInput?(record: AgentMessage): void;
+}
+
 /** One turn bracketed by the installed turn observer; see {@link AgentSession} `#startTurnObservation`. */
 type TurnObservation = {
-	finish: (error?: unknown) => void | Promise<void>;
+	observer: IrcWakeTurnObservation;
 	/** The observed turn returned; the observation only waits for owned async work. */
 	turnEnded: boolean;
 	closed: boolean;
 	turnError: unknown;
+	/** Prompt generation whose work and cancellation this observation owns. */
+	generation: number;
 };
 
 type ActiveAgentContinue = {
@@ -1019,10 +1027,12 @@ export class AgentSession implements SettingsScope {
 
 	readonly #irc: IrcBridge;
 	#ircWakeTurnObserver:
-		| ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
+		| ((records: AgentMessage[]) => IrcWakeTurnObservation | undefined)
 		| undefined;
 	/** The observation whose monitor is attached; at most one at a time. */
 	#openTurnObservation: TurnObservation | undefined;
+	/** Native executor subscriptions, including externally driven follow-up/pool turns. */
+	#taskRunMonitors: Set<(record: AgentMessage) => void> | undefined;
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
@@ -1546,19 +1556,57 @@ export class AgentSession implements SettingsScope {
 	#startTurnObservation(records: AgentMessage[]): TurnObservation | undefined {
 		const open = this.#openTurnObservation;
 		if (open) {
-			if (!open.turnEnded) return undefined;
+			if (!open.turnEnded && open.generation === this.#promptGeneration) return undefined;
 			void this.#closeTurnObservation(open);
 		}
-		let finish: TurnObservation["finish"] | undefined;
+		let observer: IrcWakeTurnObservation | undefined;
 		try {
-			finish = this.#ircWakeTurnObserver?.(records);
+			observer = this.#ircWakeTurnObserver?.(records);
 		} catch (error) {
 			logger.warn("Turn observer failed to start", { error: String(error) });
 		}
-		if (!finish) return undefined;
-		const observation: TurnObservation = { finish, turnEnded: false, closed: false, turnError: undefined };
+		if (!observer) return undefined;
+		const observation: TurnObservation = {
+			observer,
+			turnEnded: false,
+			closed: false,
+			turnError: undefined,
+			generation: this.#promptGeneration,
+		};
 		this.#openTurnObservation = observation;
 		return observation;
+	}
+
+	/**
+	 * A parent steer can join a peer wake, or a bare queued/async continuation.
+	 * The latter has no executor bracket: adopt it only on actual consumption,
+	 * then use the current in-flight settle and recovery, not a second scheduler.
+	 */
+	#observeParentInput(record: AgentMessage): void {
+		const open = this.#openTurnObservation;
+		// A prior-generation observation cannot own input consumed by its
+		// successor. Close it synchronously before consulting native ownership.
+		if (open && open.generation !== this.#promptGeneration) void this.#closeTurnObservation(open);
+		if (this.#taskRunMonitors?.size) {
+			for (const onInput of this.#taskRunMonitors) onInput(record);
+			this.#openTurnObservation?.observer.onInput?.(record);
+			return;
+		}
+		const observation = this.#startTurnObservation([record]);
+		if (!observation) return;
+		const generation = observation.generation;
+		this.#inFlightSettledCallbacks.push(async () => {
+			// The current bracket has released before we wait for recovery/owned
+			// work. A fresh wake may supersede this ended observation normally.
+			observation.turnEnded = true;
+			let turnError: unknown;
+			try {
+				await this.#waitForPostPromptRecovery(generation);
+			} catch (error) {
+				turnError = error;
+			}
+			await this.#finishTurnObservation(observation, turnError);
+		});
 	}
 
 	/**
@@ -1577,7 +1625,7 @@ export class AgentSession implements SettingsScope {
 	 * may close the observation first (see {@link #startTurnObservation}).
 	 */
 	async #finishTurnObservation(observation: TurnObservation | undefined, turnError: unknown): Promise<void> {
-		if (!observation) return;
+		if (!observation || observation.closed) return;
 		observation.turnEnded = true;
 		observation.turnError = turnError;
 		try {
@@ -1593,8 +1641,11 @@ export class AgentSession implements SettingsScope {
 		if (observation.closed) return;
 		observation.closed = true;
 		if (this.#openTurnObservation === observation) this.#openTurnObservation = undefined;
+		if (observation.generation !== this.#promptGeneration) {
+			observation.turnError ??= new DOMException("Parent-requested turn was superseded", "AbortError");
+		}
 		try {
-			await observation.finish(observation.turnError);
+			await observation.observer.finish(observation.turnError);
 		} catch (error) {
 			logger.warn("Turn observer failed to finish", { error: String(error) });
 		}
@@ -3618,6 +3669,10 @@ export class AgentSession implements SettingsScope {
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
 	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start") {
+			const parentInput = this.#irc.takeParentSteer(event.message);
+			if (parentInput) this.#observeParentInput(parentInput);
+		}
 		// Revoke before the first await: delayed end-of-turn maintenance must
 		// never revoke a foreground-control grant acquired by a later prompt.
 		const computerControlRevocation =
@@ -11460,12 +11515,21 @@ export class AgentSession implements SettingsScope {
 		this.#irc.trackReply(pending);
 	}
 
+	/** Registers the actual executor monitor until its event subscription detaches. */
+	registerTaskRunMonitor(onParentInput: (record: AgentMessage) => void): () => void {
+		const monitors = (this.#taskRunMonitors ??= new Set());
+		monitors.add(onParentInput);
+		return () => {
+			monitors.delete(onParentInput);
+		};
+	}
+
 	/**
 	 * Installs task-executor monitoring around turns no executor drives: autonomous IRC
 	 * wake turns and user prompts (focused-session steering of a kept-alive subagent).
 	 */
 	setIrcWakeTurnObserver(
-		observer: ((records: AgentMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined,
+		observer: ((records: AgentMessage[]) => IrcWakeTurnObservation | undefined) | undefined,
 	): void {
 		this.#ircWakeTurnObserver = observer;
 	}

@@ -246,9 +246,11 @@ describe("AgentSession yield empty-stop suppression", () => {
 		});
 		session.setIrcWakeTurnObserver(() => {
 			observerEvents.push("started");
-			return () => {
-				observerEvents.push(`finished:${mock.calls.length}`);
-				observerSettled.resolve();
+			return {
+				finish() {
+					observerEvents.push(`finished:${mock.calls.length}`);
+					observerSettled.resolve();
+				},
 			};
 		});
 

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type {
+	AgentSession,
+	IrcWakeTurnObservation,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { YieldTool } from "@oh-my-pi/pi-coding-agent/tools/yield";
 import { attachIrcWakeTurnMonitor } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -33,7 +36,7 @@ describe("IRC wake turn yield reset", () => {
 		// set; without a per-wake reset a later thinking-only {type:"result"}
 		// would skip the guard and finalize with the null-yield warning.
 		const yieldTool = new YieldTool(toolSession({ getLastAssistantText: () => undefined }));
-		let observer: ((records: unknown[]) => ((error?: unknown) => void | Promise<void>) | undefined) | undefined;
+		let observer: ((records: unknown[]) => IrcWakeTurnObservation | undefined) | undefined;
 		const session = {
 			...createSessionDefaults(),
 			getToolByName: (name: string) => (name === "yield" ? yieldTool : undefined),
