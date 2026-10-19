@@ -7,7 +7,6 @@
 - Fixed `wait` so delayed or unavailable broker discovery does not block local completions, messages, service exits, or cancellation ([#14860](https://github.com/can1357/oh-my-pi/pull/14860) by [@vavilonska](https://github.com/vavilonska))
 - Preserved unacknowledged service completions when a session switches cwd, including rejected switches, so resuming the owner delivers them to its transcript ([#14860](https://github.com/can1357/oh-my-pi/pull/14860) by [@vavilonska](https://github.com/vavilonska))
 - Fixed interruptible readiness checks observing a replacement service or leaving broker work polling after cancellation ([#14860](https://github.com/can1357/oh-my-pi/pull/14860) by [@vavilonska](https://github.com/vavilonska))
-- Fixed incremental subagent results rejecting legal array batches or open-union values, mixing values from multiple labels, dropping required nulls in combined output schemas, and misclassifying positional array prefixes or valid mixed scalar values ([#14925](https://github.com/can1357/oh-my-pi/pull/14925) by [@vavilonska](https://github.com/vavilonska))
 - Fixed parent messages injected into a kept-alive subagent's active turn leaving its accepted result stale and failing to deliver a completion to the parent
 
 ## [18.12.2] - 2026-10-18
